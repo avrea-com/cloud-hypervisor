@@ -51,5 +51,8 @@ vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { workspace = true }
 
+[dev-dependencies]
+block = { path = "../block", features = ["test-utils", "io_uring"] }
+
 [lints]
 workspace = true

@@ -76,7 +76,7 @@ enum Error {
 pub const SYNTAX: &str = "vhost-user-block backend parameters \
  \"path=<image_path>,socket=<socket_path>,num_queues=<number_of_queues>,\
  queue_size=<size_of_each_queue>,readonly=true|false,direct=true|false,\
- poll_queue=true|false\"";
+ poll_queue=true|false,ignore_flush=true|false\"";
 
 impl convert::From<Error> for io::Error {
     fn from(e: Error) -> Self {
@@ -91,6 +91,7 @@ struct VhostUserBlkThread {
     event_idx: bool,
     kill_evt: EventFd,
     writeback: Arc<AtomicBool>,
+    ignore_flush: bool,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
 }
 
@@ -100,6 +101,7 @@ impl VhostUserBlkThread {
         serial: Vec<u8>,
         disk_nsectors: u64,
         writeback: Arc<AtomicBool>,
+        ignore_flush: bool,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> Result<Self> {
         Ok(VhostUserBlkThread {
@@ -109,6 +111,7 @@ impl VhostUserBlkThread {
             event_idx: false,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
             writeback,
+            ignore_flush,
             mem,
         })
     }
@@ -128,6 +131,7 @@ impl VhostUserBlkThread {
                 Ok(mut request) => {
                     debug!("element is a valid request");
                     request.writeback = self.writeback.load(Ordering::Acquire);
+                    request.ignore_flush = self.ignore_flush;
                     let (status, len) = match request.execute(
                         &mut *self.disk_image.lock().unwrap(),
                         self.disk_nsectors,
@@ -214,6 +218,7 @@ struct VhostUserBlkBackend {
 }
 
 impl VhostUserBlkBackend {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         image_path: &str,
         num_queues: usize,
@@ -221,6 +226,7 @@ impl VhostUserBlkBackend {
         direct: bool,
         poll_queue: bool,
         queue_size: usize,
+        ignore_flush: bool,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> Result<Self> {
         let mut options = OpenOptions::new();
@@ -251,12 +257,19 @@ impl VhostUserBlkBackend {
         let mut queues_per_thread = Vec::new();
         let mut threads = Vec::new();
         let writeback = Arc::new(AtomicBool::new(true));
+        if ignore_flush {
+            warn!(
+                "ignore_flush=on: guest flushes and writethrough fsyncs are skipped. \
+                 {image_path} is not crash-consistent if the host goes down."
+            );
+        }
         for i in 0..num_queues {
             let thread = Mutex::new(VhostUserBlkThread::new(
                 image.clone(),
                 serial.clone(),
                 nsectors,
                 writeback.clone(),
+                ignore_flush,
                 mem.clone(),
             )?);
             threads.push(thread);
@@ -462,6 +475,7 @@ struct VhostUserBlkBackendConfig {
     readonly: bool,
     direct: bool,
     poll_queue: bool,
+    ignore_flush: bool,
 }
 
 impl VhostUserBlkBackendConfig {
@@ -474,7 +488,8 @@ impl VhostUserBlkBackendConfig {
             .add("num_queues")
             .add("queue_size")
             .add("socket")
-            .add("poll_queue");
+            .add("poll_queue")
+            .add("ignore_flush");
         parser.parse(backend).map_err(Error::FailedConfigParse)?;
 
         let path = parser.get("path").ok_or(Error::PathParameterMissing)?;
@@ -502,6 +517,11 @@ impl VhostUserBlkBackendConfig {
             .convert("queue_size")
             .map_err(Error::FailedConfigParse)?
             .unwrap_or(1024);
+        let ignore_flush = parser
+            .convert::<Toggle>("ignore_flush")
+            .map_err(Error::FailedConfigParse)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         Ok(VhostUserBlkBackendConfig {
             path,
@@ -511,6 +531,7 @@ impl VhostUserBlkBackendConfig {
             readonly,
             direct,
             poll_queue,
+            ignore_flush,
         })
     }
 }
@@ -534,6 +555,7 @@ pub fn start_block_backend(backend_command: &str) {
             backend_config.direct,
             backend_config.poll_queue,
             backend_config.queue_size,
+            backend_config.ignore_flush,
             mem.clone(),
         )
         .unwrap(),

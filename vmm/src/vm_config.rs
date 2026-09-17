@@ -416,6 +416,13 @@ pub struct DiskConfig {
     pub image_type: ImageType,
     #[serde(default)]
     pub lock_granularity: LockGranularityChoice,
+    /// Drop durability barriers: VIRTIO_BLK_T_FLUSH becomes a no-op and
+    /// writethrough (FUA) writes skip their post-write fsync. The QEMU
+    /// `cache=unsafe` equivalent when combined with the default `direct=off`.
+    /// Writes still land in the host page cache, so a guest crash is harmless
+    /// and only a host crash or power loss can corrupt the image.
+    #[serde(default)]
+    pub ignore_flush: bool,
 }
 
 impl ApplyLandlock for DiskConfig {

@@ -18,9 +18,20 @@ fn main() {
         version.pop();
     }
 
+    // Distributors can preserve a validated snapshot compatibility identity
+    // independently of whether their source checkout contains Git tags.
+    println!("cargo:rerun-if-env-changed=CH_BUILD_VERSION");
+    if let Ok(build_version) = env::var("CH_BUILD_VERSION") {
+        assert!(
+            !build_version.trim().is_empty(),
+            "CH_BUILD_VERSION is empty"
+        );
+        version = build_version;
+    }
+
     // Append CH_EXTRA_VERSION to version if it is set.
+    println!("cargo:rerun-if-env-changed=CH_EXTRA_VERSION");
     if let Ok(extra_version) = env::var("CH_EXTRA_VERSION") {
-        println!("cargo:rerun-if-env-changed=CH_EXTRA_VERSION");
         version.push_str(&format!("-{extra_version}"));
     }
 

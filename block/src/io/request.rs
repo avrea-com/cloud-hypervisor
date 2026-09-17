@@ -77,6 +77,11 @@ pub struct Request {
     data_descriptors: SmallVec<[(GuestAddress, u32); DEFAULT_DESCRIPTOR_VEC_SIZE]>,
     status_addr: GuestAddress,
     pub writeback: bool,
+    /// Drop durability barriers for this request: VIRTIO_BLK_T_FLUSH completes
+    /// without reaching the backend, and a writethrough write skips its
+    /// post-write fsync. Equivalent to QEMU's `cache.no-flush` (`cache=unsafe`).
+    /// Data still reaches the host page cache, so only a host crash loses it.
+    pub ignore_flush: bool,
     start: Instant,
 }
 
@@ -106,6 +111,7 @@ impl Request {
             data_descriptors: SmallVec::with_capacity(DEFAULT_DESCRIPTOR_VEC_SIZE),
             status_addr: GuestAddress(0),
             writeback: true,
+            ignore_flush: false,
             start: Instant::now(),
         };
 
@@ -204,12 +210,16 @@ impl Request {
                         .map_err(ExecuteError::Write)?;
                     disk.write_all_at(&buf, offset)
                         .map_err(ExecuteError::WriteAll)?;
-                    if !self.writeback {
+                    if !self.writeback && !self.ignore_flush {
                         disk.fsync().map_err(ExecuteError::Flush)?;
                     }
                     offset += u64::from(*data_len);
                 }
-                RequestType::Flush => disk.fsync().map_err(ExecuteError::Flush)?,
+                RequestType::Flush => {
+                    if !self.ignore_flush {
+                        disk.fsync().map_err(ExecuteError::Flush)?;
+                    }
+                }
                 RequestType::GetDeviceId => {
                     if (*data_len as usize) < serial.len() {
                         return Err(ExecuteError::BadRequest(Error::InvalidOffset));
@@ -301,6 +311,12 @@ impl Request {
                 }
             }
             RequestType::Flush => {
+                if self.ignore_flush {
+                    // Nothing was submitted, so there is no completion event to
+                    // wait for: report success inline.
+                    ret.async_complete = false;
+                    return Ok(ret);
+                }
                 disk_image
                     .fsync(Some(user_data))
                     .map_err(ExecuteError::AsyncFlush)?;
@@ -706,6 +722,7 @@ mod unit_tests {
             data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), DISCARD_WZ_SEG_SIZE)]),
             status_addr: GuestAddress(0),
             writeback: true,
+            ignore_flush: false,
             start: Instant::now(),
         };
         let mut disk = PanicAsyncIo(EventFd::new(0).unwrap());
@@ -715,5 +732,79 @@ mod unit_tests {
         else {
             panic!("expected BadRequest(InvalidOffset)");
         };
+    }
+
+    fn flush_request(ignore_flush: bool) -> Request {
+        Request {
+            request_type: RequestType::Flush,
+            sector: 0,
+            data_descriptors: SmallVec::new(),
+            status_addr: GuestAddress(0),
+            writeback: true,
+            ignore_flush,
+            start: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn ignore_flush_completes_flush_without_touching_the_backend() {
+        let mem = Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)]).unwrap());
+        let mut request = flush_request(true);
+        // PanicAsyncIo::fsync is unreachable!(), so reaching the backend fails
+        // the test rather than silently degrading to a real fsync.
+        let mut disk = PanicAsyncIo(EventFd::new(0).unwrap());
+
+        let ret = request
+            .execute_async(mem, 1024, &mut disk, &[], false, 0)
+            .expect("ignored flush must succeed");
+
+        // Inline completion: no submission means no completion event, so the
+        // caller has to return the descriptor itself.
+        assert!(!ret.async_complete);
+        assert!(ret.batch_request.is_none());
+    }
+
+    #[test]
+    fn flush_reaches_the_backend_by_default() {
+        let mem = Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)]).unwrap());
+        let mut request = flush_request(false);
+        let mut disk = CountingAsyncIo {
+            evt: EventFd::new(0).unwrap(),
+            fsyncs: 0,
+        };
+
+        let ret = request
+            .execute_async(mem, 1024, &mut disk, &[], false, 0)
+            .expect("flush must succeed");
+
+        assert!(ret.async_complete);
+        assert_eq!(disk.fsyncs, 1);
+    }
+
+    struct CountingAsyncIo {
+        evt: EventFd,
+        fsyncs: usize,
+    }
+
+    impl AsyncIo for CountingAsyncIo {
+        fn notifier(&self) -> &EventFd {
+            &self.evt
+        }
+        fn submit_data_operation(&mut self, _: AsyncIoOperation) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn fsync(&mut self, _: Option<u64>) -> AsyncIoResult<()> {
+            self.fsyncs += 1;
+            Ok(())
+        }
+        fn punch_hole(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn write_zeroes(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
+            None
+        }
     }
 }

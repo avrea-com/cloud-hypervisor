@@ -408,6 +408,7 @@ pub enum VmState {
     Running,
     Shutdown,
     Paused,
+    PauseFailed,
     BreakPoint,
 }
 
@@ -415,7 +416,9 @@ impl VmState {
     fn valid_transition(self, new_state: VmState) -> Result<()> {
         match self {
             VmState::Created => match new_state {
-                VmState::Created => Err(Error::InvalidStateTransition(self, new_state)),
+                VmState::Created | VmState::PauseFailed => {
+                    Err(Error::InvalidStateTransition(self, new_state))
+                }
                 VmState::Running | VmState::Paused | VmState::BreakPoint | VmState::Shutdown => {
                     Ok(())
                 }
@@ -425,13 +428,18 @@ impl VmState {
                 VmState::Created | VmState::Running => {
                     Err(Error::InvalidStateTransition(self, new_state))
                 }
-                VmState::Paused | VmState::Shutdown | VmState::BreakPoint => Ok(()),
+                VmState::Paused
+                | VmState::PauseFailed
+                | VmState::Shutdown
+                | VmState::BreakPoint => Ok(()),
             },
 
             VmState::Shutdown => match new_state {
-                VmState::Paused | VmState::Created | VmState::Shutdown | VmState::BreakPoint => {
-                    Err(Error::InvalidStateTransition(self, new_state))
-                }
+                VmState::Paused
+                | VmState::PauseFailed
+                | VmState::Created
+                | VmState::Shutdown
+                | VmState::BreakPoint => Err(Error::InvalidStateTransition(self, new_state)),
                 VmState::Running => Ok(()),
             },
 
@@ -439,7 +447,11 @@ impl VmState {
                 VmState::Created | VmState::Paused | VmState::BreakPoint => {
                     Err(Error::InvalidStateTransition(self, new_state))
                 }
+                VmState::Running | VmState::Shutdown | VmState::PauseFailed => Ok(()),
+            },
+            VmState::PauseFailed => match new_state {
                 VmState::Running | VmState::Shutdown => Ok(()),
+                _ => Err(Error::InvalidStateTransition(self, new_state)),
             },
             VmState::BreakPoint => match new_state {
                 VmState::Created | VmState::Running => Ok(()),
@@ -550,6 +562,8 @@ pub struct Vm {
     // The hypervisor abstracted virtual machine.
     vm: Arc<dyn hypervisor::Vm>,
     saved_clock: Option<SavedClock>,
+    // Retained across recovery failures so vm.resume can retry safely.
+    hypervisor_resume_pending: bool,
     #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
     #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
@@ -732,6 +746,7 @@ impl Vm {
             memory_manager,
             vm,
             saved_clock,
+            hypervisor_resume_pending: state == VmState::Paused,
             #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
             #[cfg(not(target_arch = "riscv64"))]
@@ -2753,7 +2768,7 @@ impl Vm {
     pub fn boot(&mut self) -> Result<()> {
         trace_scoped!("Vm::boot");
         let current_state = self.state;
-        if current_state == VmState::Paused {
+        if matches!(current_state, VmState::Paused | VmState::PauseFailed) {
             return self.resume().map_err(Error::Resume);
         }
 
@@ -3241,32 +3256,87 @@ impl Vm {
     }
 }
 
+fn finish_pause(
+    state: &mut VmState,
+    pause_result: result::Result<(), MigratableError>,
+    resume_vm: impl FnOnce() -> result::Result<(), MigratableError>,
+) -> result::Result<(), MigratableError> {
+    if let Err(pause_error) = pause_result {
+        let previous_state = *state;
+        // A failed rollback must remain resumable without claiming that the
+        // VM is running or safe to snapshot.
+        *state = VmState::PauseFailed;
+        if let Err(rollback_error) = resume_vm() {
+            return Err(MigratableError::Pause(
+                anyhow!(pause_error).context(format!("Pause rollback failed: {rollback_error:?}")),
+            ));
+        }
+        *state = previous_state;
+        return Err(pause_error);
+    }
+    *state = VmState::Paused;
+    Ok(())
+}
+
+// Keep vCPUs parked until every preceding recovery step succeeds. Clear the
+// hypervisor flag only on success, including across separate resume requests.
+fn resume_pause_components(
+    hypervisor_resume_pending: &mut bool,
+    resume_hypervisor: impl FnOnce() -> result::Result<(), MigratableError>,
+    resume_devices: impl FnOnce() -> result::Result<(), MigratableError>,
+    resume_cpus: impl FnOnce() -> result::Result<(), MigratableError>,
+) -> result::Result<(), MigratableError> {
+    if *hypervisor_resume_pending {
+        resume_hypervisor()?;
+        *hypervisor_resume_pending = false;
+    }
+    resume_devices()?;
+    resume_cpus()
+}
+
+impl Vm {
+    fn resume_from_pause(&mut self) -> result::Result<(), MigratableError> {
+        self.restore_guest_clock()?;
+        resume_pause_components(
+            &mut self.hypervisor_resume_pending,
+            || {
+                self.vm
+                    .resume()
+                    .map_err(|e| MigratableError::Resume(anyhow!("Could not resume the VM: {e}")))
+            },
+            || self.device_manager.lock().unwrap().resume(),
+            || self.cpu_manager.lock().unwrap().resume(),
+        )
+    }
+}
+
 impl Pausable for Vm {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
         event!("vm", "pausing");
-        let new_state = VmState::Paused;
         self.state
-            .valid_transition(new_state)
+            .valid_transition(VmState::Paused)
             .map_err(|e| MigratableError::Pause(anyhow!("Invalid transition: {e:?}")))?;
 
-        // Before pausing the vCPUs activate any pending virtio devices that might
-        // need activation between starting the pause (or e.g. a migration it's part of)
         self.activate_virtio_devices().map_err(|e| {
             MigratableError::Pause(anyhow!("Error activating pending virtio devices: {e:?}"))
         })?;
 
-        self.cpu_manager.lock().unwrap().pause()?;
-
-        // Capture the guest clock now that the vCPUs are quiesced.
-        self.saved_clock = self.capture_guest_clock()?;
-
-        self.device_manager.lock().unwrap().pause()?;
-
-        self.vm
-            .pause()
-            .map_err(|e| MigratableError::Pause(anyhow!("Could not pause the VM: {e}")))?;
-
-        self.state = new_state;
+        // Never restore an earlier pause's clock if this capture fails.
+        self.saved_clock = None;
+        let pause_result = (|| {
+            self.cpu_manager.lock().unwrap().pause()?;
+            self.saved_clock = self.capture_guest_clock()?;
+            self.device_manager.lock().unwrap().pause()?;
+            // A failed hypervisor pause may have applied part of its state.
+            self.hypervisor_resume_pending = true;
+            self.vm
+                .pause()
+                .map_err(|e| MigratableError::Pause(anyhow!("Could not pause the VM: {e}")))
+        })();
+        let mut state = self.state;
+        let result = finish_pause(&mut state, pause_result, || self.resume_from_pause());
+        self.state = state;
+        result?;
 
         event!("vm", "paused");
         Ok(())
@@ -3274,27 +3344,16 @@ impl Pausable for Vm {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         event!("vm", "resuming");
-        let current_state = self.get_state();
-        let new_state = VmState::Running;
-
         self.state
-            .valid_transition(new_state)
+            .valid_transition(VmState::Running)
             .map_err(|e| MigratableError::Resume(anyhow!("Invalid transition: {e:?}")))?;
 
-        // Restore the guest clock before the vCPUs start running.
-        self.restore_guest_clock()?;
-
-        if current_state == VmState::Paused {
-            self.vm
-                .resume()
-                .map_err(|e| MigratableError::Resume(anyhow!("Could not resume the VM: {e}")))?;
+        if matches!(self.state, VmState::Paused | VmState::PauseFailed) {
+            self.state = VmState::PauseFailed;
         }
-
-        self.device_manager.lock().unwrap().resume()?;
-        self.cpu_manager.lock().unwrap().resume()?;
-
-        // And we're back to the Running state.
-        self.state = new_state;
+        self.resume_from_pause()?;
+        self.saved_clock = None;
+        self.state = VmState::Running;
         event!("vm", "resumed");
         Ok(())
     }
@@ -3328,7 +3387,7 @@ impl Snapshottable for Vm {
 
         if self.get_state() != VmState::Paused {
             return Err(MigratableError::Snapshot(anyhow!(
-                "Trying to snapshot while VM is running"
+                "Trying to snapshot while VM is not paused"
             )));
         }
 
@@ -3627,6 +3686,117 @@ impl GuestDebuggable for Vm {
     }
 }
 
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    #[test]
+    fn pause_failure_with_failed_rollback_allows_resume_retry() {
+        let mut state = VmState::Running;
+        let result = finish_pause(
+            &mut state,
+            Err(MigratableError::Pause(anyhow!("injected flush failure"))),
+            || Err(MigratableError::Resume(anyhow!("injected resume failure"))),
+        );
+        assert!(format!("{result:?}").contains("rollback failed"));
+        assert!(state.valid_transition(VmState::Running).is_ok());
+        assert!(state.valid_transition(VmState::Shutdown).is_ok());
+        assert_ne!(state, VmState::Running);
+        assert_ne!(state, VmState::Paused);
+    }
+    #[test]
+    fn pause_success_does_not_run_rollback() {
+        let mut state = VmState::Running;
+        finish_pause(&mut state, Ok(()), || panic!("Unexpected rollback")).unwrap();
+        assert_eq!(state, VmState::Paused);
+    }
+
+    #[test]
+    fn pause_failure_preserves_original_error_after_recovery() {
+        for initial in [VmState::Running, VmState::Created] {
+            let mut state = initial;
+            let error = finish_pause(
+                &mut state,
+                Err(MigratableError::Pause(anyhow!("injected pause failure"))),
+                || Ok(()),
+            )
+            .unwrap_err();
+            assert!(format!("{error:?}").contains("injected pause failure"));
+            assert_eq!(state, initial);
+        }
+    }
+
+    #[test]
+    fn pause_failed_state_is_reported_and_cannot_snapshot_or_pause() {
+        let state = VmState::PauseFailed;
+        assert_eq!(serde_json::to_string(&state).unwrap(), "\"PauseFailed\"");
+        assert_ne!(state, VmState::Paused);
+        for target in [
+            VmState::Created,
+            VmState::Paused,
+            VmState::PauseFailed,
+            VmState::BreakPoint,
+        ] {
+            assert!(state.valid_transition(target).is_err());
+        }
+        assert!(state.valid_transition(VmState::Running).is_ok());
+        assert!(state.valid_transition(VmState::Shutdown).is_ok());
+    }
+
+    #[test]
+    fn pause_recovery_retries_hypervisor_before_devices_and_cpus() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        let mut pending = true;
+        let result = resume_pause_components(
+            &mut pending,
+            || Err(MigratableError::Resume(anyhow!("hypervisor resume failed"))),
+            || panic!("Devices must wait for hypervisor recovery"),
+            || panic!("CPUs must remain parked"),
+        );
+        assert!(result.is_err());
+        assert!(pending);
+        resume_pause_components(
+            &mut pending,
+            || {
+                events.borrow_mut().push("hypervisor");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("devices");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("cpus");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!pending);
+        assert_eq!(*events.borrow(), ["hypervisor", "devices", "cpus"]);
+    }
+
+    #[test]
+    fn pause_recovery_retries_devices_without_resuming_cpus_early() {
+        let mut pending = true;
+        let result = resume_pause_components(
+            &mut pending,
+            || Ok(()),
+            || Err(MigratableError::Resume(anyhow!("device resume failed"))),
+            || panic!("CPUs must remain parked"),
+        );
+        assert!(result.is_err());
+        assert!(!pending);
+        resume_pause_components(
+            &mut pending,
+            || panic!("Hypervisor already recovered"),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 #[cfg(test)]
 mod unit_tests {
@@ -3664,6 +3834,14 @@ mod unit_tests {
                 state.valid_transition(VmState::Running).unwrap();
                 state.valid_transition(VmState::Shutdown).unwrap();
                 state.valid_transition(VmState::Paused).unwrap_err();
+                state.valid_transition(VmState::BreakPoint).unwrap_err();
+            }
+            VmState::PauseFailed => {
+                state.valid_transition(VmState::Created).unwrap_err();
+                state.valid_transition(VmState::Running).unwrap();
+                state.valid_transition(VmState::Shutdown).unwrap();
+                state.valid_transition(VmState::Paused).unwrap_err();
+                state.valid_transition(VmState::PauseFailed).unwrap_err();
                 state.valid_transition(VmState::BreakPoint).unwrap_err();
             }
             VmState::BreakPoint => {

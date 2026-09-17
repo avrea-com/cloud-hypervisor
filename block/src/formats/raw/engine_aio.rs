@@ -80,7 +80,9 @@ impl AsyncIo for RawAio {
                 .map_err(AsyncIoError::Fsync)?;
         } else {
             // SAFETY: FFI call with a valid fd
-            unsafe { libc::fsync(fd) };
+            if unsafe { libc::fsync(fd) } < 0 {
+                return Err(AsyncIoError::Fsync(std::io::Error::last_os_error()));
+            }
         }
 
         Ok(())

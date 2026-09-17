@@ -522,7 +522,10 @@ components:
 
     VmState:
       type: string
-      enum: [Created, Running, Shutdown, Paused]
+      enum: [Created, Running, Shutdown, Paused, PauseFailed]
+      description: >-
+        PauseFailed means pause or resume recovery did not complete. The VM
+        cannot be snapshotted or migrated; vm.resume can retry recovery.
 
     VmInfo:
       required:
@@ -1037,6 +1040,14 @@ components:
           $ref: "#/components/schemas/ImageType"
         lock_granularity:
           $ref: "#/components/schemas/LockGranularity"
+        ignore_flush:
+          type: boolean
+          default: false
+          description: >-
+            Treat guest flush requests and writethrough (FUA) writes as no-ops.
+            Equivalent to QEMU's cache=unsafe when direct is false. Improves
+            throughput for ephemeral disks at the cost of crash consistency:
+            a host crash or power loss can leave the image corrupt.
 
     NetConfig:
       type: object
