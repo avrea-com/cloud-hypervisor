@@ -189,6 +189,7 @@ struct BlockEpollHandler {
     access_platform: Option<Arc<dyn AccessPlatform>>,
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
+    ignore_flush: bool,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -344,6 +345,7 @@ impl BlockEpollHandler {
             }
 
             request.writeback = self.writeback.load(Ordering::Acquire);
+            request.ignore_flush = self.ignore_flush;
 
             let result = request.execute_async(
                 self.mem.memory().into_inner(),
@@ -511,6 +513,7 @@ impl BlockEpollHandler {
             if result >= 0
                 && request.request_type() == RequestType::Out
                 && !request.writeback
+                && !self.ignore_flush
                 && let Err(e) = self.disk_image.fsync(None)
             {
                 warn!("Writethrough fsync failed: {e}");
@@ -790,6 +793,7 @@ pub struct Block {
     exit_evt: EventFd,
     serial: Box<[u8]>,
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
+    ignore_flush: bool,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
@@ -823,6 +827,7 @@ impl Block {
         state: Option<BlockState>,
         queue_affinity: BTreeMap<u16, Box<[usize]>>,
         sparse: bool,
+        ignore_flush: bool,
         lock_granularity: LockGranularityChoice,
         guest_block_size: Option<u32>,
     ) -> io::Result<Self> {
@@ -933,6 +938,13 @@ impl Block {
 
         let serial = build_serial(serial, &disk_path).into_boxed_slice();
 
+        if ignore_flush {
+            warn!(
+                "virtio-block {id}: ignore_flush=on, guest flushes and writethrough fsyncs are skipped. \
+                 Disk contents are not crash-consistent if the host goes down."
+            );
+        }
+
         Ok(Block {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Block as u32,
@@ -954,6 +966,7 @@ impl Block {
             exit_evt,
             serial,
             queue_affinity,
+            ignore_flush,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
@@ -1236,6 +1249,7 @@ impl VirtioDevice for Block {
                 access_platform: self.common.access_platform(),
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
+                ignore_flush: self.ignore_flush,
                 active_request_count: Arc::clone(&self.active_request_count),
                 draining_active_requests: Arc::clone(&self.draining_active_requests),
             };
@@ -1343,9 +1357,25 @@ impl Pausable for Block {
                 // copies and migration disk-lock handoff read the file directly.
                 self.disk_image.sync_metadata().map_err(|e| {
                     MigratableError::Pause(anyhow::Error::new(e).context("sync disk metadata"))
-                })
-            })
-            .and_then(|()| self.common.pause());
+                })?;
+                // Guest flush suppression never applies to the pause/archive
+                // boundary. A fresh engine shares the format metadata with the
+                // drained workers; fsync(None) completes synchronously and also
+                // makes raw-format data durable, which sync_metadata does not.
+                let mut disk = self.disk_image.create_async_io(1).map_err(|e| {
+                    MigratableError::Pause(anyhow!(
+                        "Could not open disk {} for pause flush: {e}",
+                        self.id
+                    ))
+                })?;
+                disk.fsync(None).map_err(|e| {
+                    MigratableError::Pause(anyhow!(
+                        "Could not flush disk {} before pause: {e}",
+                        self.id
+                    ))
+                })?;
+                self.common.pause()
+            });
 
         self.draining_active_requests.store(false, Ordering::SeqCst);
         result
@@ -1378,12 +1408,13 @@ impl Migratable for Block {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::{self, Result as IoResult};
     use std::path::Path;
     use std::sync::{Mutex, mpsc};
+    use std::{env, fs};
 
     use block::async_io::{AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
+    use block::formats::raw::RawBackend;
     use hypervisor::Vm;
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::desc::split::Descriptor;
@@ -1458,6 +1489,7 @@ mod tests {
             None,
             BTreeMap::new(),
             true,
+            false,
             LockGranularityChoice::default(),
             None,
         )
@@ -1517,6 +1549,7 @@ mod tests {
             access_platform: None,
             host_cpus: None,
             acked_features,
+            ignore_flush: false,
         }
     }
 
@@ -1741,8 +1774,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn writethrough_write_fails_when_fsync_fails() {
+    /// Status of a one sector writethrough write whose backend fails every fsync.
+    fn writethrough_write_status(ignore_flush: bool) -> u8 {
         let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
         mem.write_obj(VIRTIO_BLK_T_OUT, GuestAddress(REQ_HDR_ADDR))
@@ -1756,6 +1789,7 @@ mod tests {
         vq.avail.idx.set(1);
 
         let mut handler = make_handler(vq.create_queue(), &mem, 0);
+        handler.ignore_flush = ignore_flush;
         handler.disk_nsectors.store(1, Ordering::SeqCst);
         handler.disk_image = Box::new(FailingFsync(
             EventFd::new(EFD_NONBLOCK).unwrap(),
@@ -1765,8 +1799,17 @@ mod tests {
         handler.process_queue_complete().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
-        let status: u8 = mem.read_obj(GuestAddress(REQ_STATUS_ADDR)).unwrap();
-        assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
+        mem.read_obj(GuestAddress(REQ_STATUS_ADDR)).unwrap()
+    }
+
+    #[test]
+    fn writethrough_write_fails_when_fsync_fails() {
+        assert_eq!(writethrough_write_status(false), VIRTIO_BLK_S_IOERR as u8);
+    }
+
+    #[test]
+    fn ignore_flush_skips_the_writethrough_fsync() {
+        assert_eq!(writethrough_write_status(true), VIRTIO_BLK_S_OK as u8);
     }
 
     #[test]
@@ -1944,5 +1987,336 @@ mod tests {
             mem.read_obj::<u8>(GuestAddress(REQ_STATUS_ADDR)).unwrap(),
             VIRTIO_BLK_S_IOERR as u8
         );
+    }
+
+    fn pause_test_block(disk: Box<dyn AsyncFullDiskFile>, ignore_flush: bool) -> Block {
+        Block::new(
+            "pause-test".into(),
+            disk,
+            PathBuf::new(),
+            false,
+            false,
+            1,
+            128,
+            None,
+            SeccompAction::Allow,
+            None,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            None,
+            BTreeMap::new(),
+            false,
+            ignore_flush,
+            LockGranularityChoice::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn complete_io(io: &mut dyn AsyncIo) -> AsyncIoCompletion {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(completion) = io.next_completed_request() {
+                assert!(completion.result >= 0, "I/O failed: {}", completion.result);
+                return completion;
+            }
+            assert!(Instant::now() < deadline, "I/O completion timed out");
+            thread::yield_now();
+        }
+    }
+
+    fn assert_pause_persists_qcow(use_io_uring: bool, ignore_flush: bool) {
+        use std::fs::{File, OpenOptions};
+
+        use block::async_io::OwnedIoBuffer;
+        use block::disk_file::AsyncDiskFile;
+        use block::formats::qcow::{IncompatFeatures, QcowDisk, QcowHeader, QcowTempDisk};
+        use vmm_sys_util::tempfile::TempFile;
+
+        let image = QcowTempDisk::new(16 << 20, None, false, true, false)
+            .unwrap()
+            .into_tempfile();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(image.as_path())
+            .unwrap();
+        let disk = QcowDisk::new(file, false, false, true, use_io_uring).unwrap();
+        let mut writer = disk.create_async_io(8).unwrap();
+        let mut device = pause_test_block(Box::new(disk), ignore_flush);
+        let active = Arc::clone(&device.active_request_count);
+        active.store(1, Ordering::SeqCst);
+        let pattern = vec![0x5a; 4096];
+        let expected = pattern.clone();
+        let write = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            writer
+                .write_from_vec(2 << 20, OwnedIoBuffer::from_vec(pattern), 1)
+                .unwrap();
+            complete_io(writer.as_mut());
+            active.store(0, Ordering::SeqCst);
+        });
+
+        device.pause().unwrap();
+        write.join().unwrap();
+        assert!(device.common.pause_common.pause_requested());
+        assert!(!device.draining_active_requests.load(Ordering::SeqCst));
+
+        // Archive while the original device is still alive: its Drop cannot
+        // conceal a missing pause flush by writing metadata during teardown.
+        let archived = TempFile::new().unwrap();
+        fs::copy(image.as_path(), archived.as_path()).unwrap();
+        let header = QcowHeader::new(&block::AlignedFile::new(
+            File::open(archived.as_path()).unwrap(),
+            false,
+        ))
+        .unwrap();
+        assert_ne!(
+            header.incompatible_features & IncompatFeatures::DIRTY.bits(),
+            0
+        );
+        let restored = QcowDisk::new(
+            File::open(archived.as_path()).unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut reader = restored.create_async_io(1).unwrap();
+        reader
+            .read_to_vec(2 << 20, OwnedIoBuffer::from_vec(vec![0; 4096]), 2)
+            .unwrap();
+        let actual = complete_io(reader.as_mut()).buffer.unwrap();
+        assert_eq!(actual.as_slice(), expected);
+        drop(reader);
+        drop(restored);
+
+        // A writable restore rebuilds refcounts while the dirty marker is
+        // still set. Verify data survives that path too, before source Drop.
+        let writable = QcowDisk::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(archived.as_path())
+                .unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let mut reader = writable.create_async_io(1).unwrap();
+        reader
+            .read_to_vec(2 << 20, OwnedIoBuffer::from_vec(vec![0; 4096]), 3)
+            .unwrap();
+        assert_eq!(
+            complete_io(reader.as_mut()).buffer.unwrap().as_slice(),
+            expected
+        );
+        drop(reader);
+        drop(writable);
+        let header = QcowHeader::new(&block::AlignedFile::new(
+            File::open(archived.as_path()).unwrap(),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            header.incompatible_features & IncompatFeatures::DIRTY.bits(),
+            0
+        );
+        device.resume().unwrap();
+        assert!(!device.common.pause_common.pause_requested());
+    }
+
+    #[test]
+    fn pause_flush_persists_qcow_sync_without_shutdown() {
+        for ignore_flush in [false, true] {
+            assert_pause_persists_qcow(false, ignore_flush);
+        }
+    }
+
+    fn pause_test_io_uring_available() -> bool {
+        let supported = block::block_io_uring_is_supported();
+        if !supported {
+            assert!(
+                env::var_os("CH_REQUIRE_IO_URING_TESTS").is_none(),
+                "io_uring is required for this validation run but is unavailable"
+            );
+            eprintln!("SKIPPED io_uring pause test: kernel or sandbox does not support io_uring");
+        }
+        supported
+    }
+
+    #[test]
+    fn pause_flush_persists_qcow_uring_without_shutdown() {
+        if !pause_test_io_uring_available() {
+            return;
+        }
+        for ignore_flush in [false, true] {
+            assert_pause_persists_qcow(true, ignore_flush);
+        }
+    }
+
+    fn assert_pause_flush_failure(backend: RawBackend) {
+        use std::fs::File;
+
+        use block::formats::raw::RawDisk;
+        use vmm_sys_util::tempfile::TempFile;
+
+        let image = TempFile::new().unwrap();
+        image.as_file().set_len(1 << 20).unwrap();
+        let healthy = RawDisk::new(image.as_file().try_clone().unwrap(), backend, false);
+        let mut device = pause_test_block(Box::new(healthy), true);
+        // Linux rejects fsync on /dev/null with EINVAL. Keep a real I/O
+        // backend so this also detects swallowed synchronous flush errors.
+        device.disk_image = Box::new(RawDisk::new(
+            File::open("/dev/null").unwrap(),
+            backend,
+            false,
+        ));
+        let error = device.pause().unwrap_err();
+        assert!(
+            format!("{error:?}").contains("Could not flush disk"),
+            "{backend:?} did not reach the backend flush: {error}"
+        );
+        assert!(!device.draining_active_requests.load(Ordering::SeqCst));
+        assert!(!device.common.pause_common.pause_requested());
+        device.disk_image = Box::new(RawDisk::new(
+            image.as_file().try_clone().unwrap(),
+            backend,
+            false,
+        ));
+        device.pause().unwrap();
+        device.resume().unwrap();
+    }
+
+    #[test]
+    fn pause_flush_failure_sync_keeps_device_resumable() {
+        assert_pause_flush_failure(RawBackend::Sync);
+    }
+
+    #[test]
+    fn pause_flush_failure_aio_keeps_device_resumable() {
+        assert_pause_flush_failure(RawBackend::Aio);
+    }
+
+    #[test]
+    fn pause_flush_failure_uring_keeps_device_resumable() {
+        if !pause_test_io_uring_available() {
+            return;
+        }
+        assert_pause_flush_failure(RawBackend::IoUring);
+    }
+
+    /// Lays out the header/status chain a driver submits for
+    /// VIRTIO_BLK_T_FLUSH. Flush carries no data descriptor.
+    fn flush_chain(mem: &GuestMemory) -> GuestQ<'_, GuestMemory> {
+        let vq = GuestQ::new(GuestAddress(0x1000), mem, 4);
+
+        // struct virtio_blk_outhdr { type, ioprio, sector }
+        mem.write_obj::<u32>(VIRTIO_BLK_T_FLUSH, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        mem.write_obj::<u32>(0, GuestAddress(REQ_HDR_ADDR + 4))
+            .unwrap();
+        mem.write_obj::<u64>(0, GuestAddress(REQ_HDR_ADDR + 8))
+            .unwrap();
+        mem.write_obj::<u8>(0xff, GuestAddress(REQ_STATUS_ADDR))
+            .unwrap();
+
+        vq.dtable[0].set(REQ_HDR_ADDR, 16, VRING_DESC_F_NEXT as u16, 1);
+        vq.dtable[1].set(REQ_STATUS_ADDR, 1, VRING_DESC_F_WRITE as u16, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        vq
+    }
+
+    /// An AsyncIo that records fsync submissions instead of performing them.
+    struct FlushCounter {
+        evt: EventFd,
+        fsyncs: Arc<AtomicUsize>,
+    }
+
+    impl AsyncIo for FlushCounter {
+        fn notifier(&self) -> &EventFd {
+            &self.evt
+        }
+        fn submit_data_operation(&mut self, _: AsyncIoOperation) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn fsync(&mut self, _: Option<u64>) -> AsyncIoResult<()> {
+            self.fsyncs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn punch_hole(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn write_zeroes(&mut self, _: u64, _: u64, _: u64) -> AsyncIoResult<()> {
+            unreachable!()
+        }
+        fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
+            None
+        }
+    }
+
+    fn flush_handler(
+        mem: &GuestMemory,
+        vq: &GuestQ<'_, GuestMemory>,
+        fsyncs: &Arc<AtomicUsize>,
+        ignore_flush: bool,
+    ) -> BlockEpollHandler {
+        let mut handler = make_handler_with_io(
+            vq.create_queue(),
+            mem,
+            1u64 << VIRTIO_BLK_F_FLUSH,
+            Box::new(FlushCounter {
+                evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+                fsyncs: Arc::clone(fsyncs),
+            }),
+        );
+        handler.disk_nsectors.store(1024, Ordering::SeqCst);
+        handler.writeback.store(true, Ordering::SeqCst);
+        handler.ignore_flush = ignore_flush;
+        handler
+    }
+
+    #[test]
+    fn ignore_flush_completes_the_chain_without_backend_fsync() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = flush_chain(&mem);
+        let fsyncs = Arc::new(AtomicUsize::new(0));
+        let mut handler = flush_handler(&mem, &vq, &fsyncs, true);
+
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(fsyncs.load(Ordering::SeqCst), 0);
+        // Completed inline rather than parked awaiting a completion event.
+        assert!(handler.inflight_requests.is_empty());
+        assert_eq!(handler.active_request_count.load(Ordering::SeqCst), 0);
+        // The guest sees a successful flush: status byte plus a used entry
+        // covering the one byte written back.
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(REQ_STATUS_ADDR)).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        assert_eq!(vq.used.idx.get(), 1);
+        let used0 = vq.used.ring[0].location;
+        assert_eq!(mem.read_obj::<u32>(used0).unwrap(), 0, "used head index");
+        assert_eq!(used_len(&vq, &mem), 1, "used length covers the status byte");
+    }
+
+    #[test]
+    fn flush_reaches_the_backend_by_default() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = flush_chain(&mem);
+        let fsyncs = Arc::new(AtomicUsize::new(0));
+        let mut handler = flush_handler(&mem, &vq, &fsyncs, false);
+
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(fsyncs.load(Ordering::SeqCst), 1);
+        // Parked until the backend reports completion, so nothing is used yet.
+        assert_eq!(handler.inflight_requests.len(), 1);
+        assert_eq!(vq.used.idx.get(), 0);
     }
 }

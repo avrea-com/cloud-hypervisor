@@ -53,6 +53,7 @@ zerocopy = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 vhost-user-backend = { workspace = true }
+block = { path = "../block", features = ["test-utils", "io_uring"] }
 
 [lints]
 workspace = true
