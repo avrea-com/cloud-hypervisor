@@ -378,6 +378,11 @@ pub enum ValidationError {
     /// The vhost-user backend provides the virtio config space
     #[error("guest_block_size is not supported with vhost-user")]
     VhostUserGuestBlockSizeNotSupported,
+    /// Ignoring flushes is not supported with vhost-user
+    #[error(
+        "ignore_flush is not supported with vhost-user; set it on the vhost-user-block backend instead"
+    )]
+    VhostUserIgnoreFlushNotSupported,
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -1501,7 +1506,7 @@ impl DiskConfig {
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
          serial=<serial_number>,backing_files=on|off,sparse=on|off,\
          image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-         guest_block_size=<size_in_bytes>";
+         guest_block_size=<size_in_bytes>,ignore_flush=on|off";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1529,6 +1534,7 @@ impl DiskConfig {
             .add("image_type")
             .add("lock_granularity")
             .add("guest_block_size")
+            .add("ignore_flush")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1625,6 +1631,11 @@ impl DiskConfig {
             .convert::<LockGranularityChoice>("lock_granularity")
             .map_err(Error::ParseDisk)?
             .unwrap_or_default();
+        let ignore_flush = parser
+            .convert::<Toggle>("ignore_flush")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         let guest_block_size = parser
             .convert::<u32>("guest_block_size")
@@ -1684,6 +1695,7 @@ impl DiskConfig {
             image_type,
             lock_granularity,
             guest_block_size,
+            ignore_flush,
         })
     }
 
@@ -1728,6 +1740,13 @@ impl DiskConfig {
 
         if self.vhost_user && self.guest_block_size.is_some() {
             return Err(ValidationError::VhostUserGuestBlockSizeNotSupported);
+        }
+
+        // The vhost-user backend owns the file descriptor and issues the
+        // fsyncs, so honouring the flag here is impossible. Reject rather than
+        // silently leave durability guarantees intact.
+        if self.vhost_user && self.ignore_flush {
+            return Err(ValidationError::VhostUserIgnoreFlushNotSupported);
         }
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
@@ -4645,6 +4664,7 @@ mod tests {
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
             guest_block_size: None,
+            ignore_flush: false,
         }
     }
 
@@ -4781,6 +4801,17 @@ mod tests {
             }
         );
         DiskConfig::parse("path=/path/to_file,guest_block_size=abc").unwrap_err();
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,ignore_flush=on")?,
+            DiskConfig {
+                ignore_flush: true,
+                ..disk_fixture()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,ignore_flush=off")?,
+            DiskConfig { ..disk_fixture() }
+        );
         Ok(())
     }
 
@@ -6578,6 +6609,29 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::VhostUserRateLimiterNotSupported)
         );
+
+        // Test vhost_user with ignore_flush for disk
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/path/to/sock".to_owned()),
+            ignore_flush: true,
+            ..disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserIgnoreFlushNotSupported)
+        );
+
+        // ignore_flush on a regular disk is accepted
+        let mut still_valid_config = valid_config.clone();
+        still_valid_config.disks = Some(vec![DiskConfig {
+            ignore_flush: true,
+            ..raw_disk_fixture()
+        }]);
+        still_valid_config.validate().unwrap();
 
         // Test vhost_user with rate limiting for net
         let mut invalid_config = valid_config.clone();
