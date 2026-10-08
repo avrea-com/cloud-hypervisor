@@ -410,4 +410,44 @@ mod unit_tests {
         let disk = QcowDisk::new(file, false, false, true, false).unwrap();
         assert!(disk.physical_size().unwrap() < disk.logical_size().unwrap());
     }
+
+    /// Freed clusters normally become reusable on a guest flush. A guest
+    /// whose flushes never reach the image (ignore_flush=on) must still be
+    /// able to reuse the clusters it discarded once the image file reaches
+    /// the offset its refcount table can address.
+    #[test]
+    fn discarded_clusters_are_reused_at_refcount_limit_without_flush() {
+        const VIRTUAL_SIZE: u64 = 1 << 20;
+        let file = QcowTempDisk::new(VIRTUAL_SIZE, None, false, true, false)
+            .unwrap()
+            .into_tempfile()
+            .into_file();
+        let probe = file.try_clone().unwrap();
+        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let metadata = disk.metadata();
+        let cluster_size = metadata.cluster_size();
+        let limit = metadata.max_valid_cluster_offset();
+        // Allocating every guest cluster once per cycle reaches the limit
+        // after limit / VIRTUAL_SIZE cycles; the rest must reuse clusters.
+        let cycles = limit / VIRTUAL_SIZE + 64;
+
+        for cycle in 0..cycles {
+            for address in (0..VIRTUAL_SIZE).step_by(cluster_size as usize) {
+                metadata
+                    .map_cluster_for_write(address, None)
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: write at {address:#x}: {e}"));
+            }
+            metadata
+                .deallocate_bytes(0, VIRTUAL_SIZE as usize, true, false, None)
+                .unwrap_or_else(|e| panic!("cycle {cycle}: discard: {e}"));
+        }
+        assert!(probe.metadata().unwrap().len() <= limit + cluster_size);
+
+        let pattern = vec![0x5a; VIRTUAL_SIZE as usize];
+        disk.write_all_at(0, &pattern);
+        metadata.flush().unwrap();
+        drop(disk);
+        let reopened = QcowDisk::new(probe, false, false, true, false).unwrap();
+        assert_eq!(reopened.read_all_at(0, VIRTUAL_SIZE as usize), pattern);
+    }
 }
