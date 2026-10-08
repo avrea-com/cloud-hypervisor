@@ -120,6 +120,10 @@ pub(super) struct QcowMetadata {
     decoder: Arc<dyn Decoder>,
 }
 
+/// Clusters a single allocating metadata operation can consume: a data
+/// cluster, a replacement L2 table, and refcount blocks covering both.
+const ALLOC_HEADROOM_CLUSTERS: u64 = 8;
+
 /// The actual metadata state, accessible only through the RwLock.
 pub(crate) struct QcowState {
     pub(crate) header: QcowHeader,
@@ -358,6 +362,15 @@ impl QcowMetadata {
     }
 
     #[cfg(test)]
+    pub fn max_valid_cluster_offset(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap()
+            .refcounts
+            .max_valid_cluster_offset()
+    }
+
+    #[cfg(test)]
     pub fn cluster_refcount(&self, address: u64) -> io::Result<u64> {
         let mut inner = self.inner.write().unwrap();
         let QcowState {
@@ -529,6 +542,7 @@ impl QcowState {
         if address >= self.header.size {
             return Err(io::Error::from_raw_os_error(EINVAL));
         }
+        self.reclaim_freed_clusters_near_limit()?;
 
         let l1_index = self.l1_table_index(address) as usize;
         let l2_addr_disk = match self.l1_table.get(l1_index) {
@@ -650,6 +664,37 @@ impl QcowState {
             })?;
         }
         Ok(new_cluster)
+    }
+
+    /// Makes clusters freed since the last flush reusable when the image
+    /// file is about to outgrow the offsets its refcount table can address.
+    ///
+    /// Freed clusters normally become reusable only in `flush`, after
+    /// `sync_caches` has made the metadata that stopped referencing them
+    /// durable. When guest flushes never reach the image (ignore_flush=on),
+    /// every allocation extends the file instead, and `get_new_cluster`
+    /// fails with ENOSPC although the guest has discarded most of its data.
+    /// This performs the same sync and recycle on demand. Callers run it
+    /// before mutating any metadata, while every cluster in
+    /// `unref_clusters` already has a zero refcount.
+    fn reclaim_freed_clusters_near_limit(&mut self) -> io::Result<()> {
+        if self.unref_clusters.is_empty()
+            || self.avail_clusters.len() as u64 >= ALLOC_HEADROOM_CLUSTERS
+        {
+            return Ok(());
+        }
+        let headroom = ALLOC_HEADROOM_CLUSTERS * self.raw_file.cluster_size();
+        let file_end = self.raw_file.physical_size()?;
+        if file_end.saturating_add(headroom) <= self.refcounts.max_valid_cluster_offset() {
+            return Ok(());
+        }
+        self.sync_caches()?;
+        log::debug!(
+            "Reclaiming {} freed QCOW2 clusters at refcount table limit",
+            self.unref_clusters.len()
+        );
+        self.avail_clusters.append(&mut self.unref_clusters);
+        Ok(())
     }
 
     /// Allocates a new cluster from the free list or by extending the file.
@@ -865,6 +910,7 @@ impl QcowState {
 
         if l2_addr_disk == 0 {
             if zero_marker {
+                self.reclaim_freed_clusters_near_limit()?;
                 if let Some(new_addr) = self.cache_l2_cluster_alloc(l1_index, l2_addr_disk)? {
                     self.set_cluster_refcount_track_freed(new_addr, 1)?;
                 }
