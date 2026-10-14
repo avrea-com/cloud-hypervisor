@@ -481,4 +481,205 @@ mod tests {
         let disk = QcowDisk::new(file, false, false, true, false).unwrap();
         assert!(disk.physical_size().unwrap() < disk.logical_size().unwrap());
     }
+
+    /// Freed clusters normally become reusable on a guest flush. A guest
+    /// whose flushes never reach the image (ignore_flush=on) must still get
+    /// the clusters it discarded back once the file outgrows its virtual
+    /// size, instead of extending the file on every rewrite.
+    #[test]
+    fn discarded_clusters_are_reused_past_virtual_size_without_flush() {
+        use super::metadata::{ALLOC_HEADROOM_CLUSTERS, DeallocAction};
+
+        const VIRTUAL_SIZE: u64 = 1 << 20;
+        const CYCLES: u64 = 64;
+        let file = QcowTempDisk::new(VIRTUAL_SIZE, None, false, true, false)
+            .unwrap()
+            .into_tempfile()
+            .into_file();
+        let probe = file.try_clone().unwrap();
+        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let metadata = disk.metadata();
+        let cluster_size = metadata.cluster_size();
+
+        let mut first_cycle_len = 0;
+        for cycle in 0..CYCLES {
+            for address in (0..VIRTUAL_SIZE).step_by(cluster_size as usize) {
+                metadata
+                    .map_cluster_for_write(address, None)
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: write at {address:#x}: {e}"));
+            }
+            let actions = metadata
+                .deallocate_bytes(0, VIRTUAL_SIZE as usize, true, false, None)
+                .unwrap_or_else(|e| panic!("cycle {cycle}: discard: {e}"));
+            // The engines publish a freed cluster only after its host
+            // punch-hole succeeds.
+            for action in actions {
+                if let DeallocAction::PunchHole { host_offset, .. } = action {
+                    metadata.complete_punch_hole(host_offset);
+                }
+            }
+            if cycle == 0 {
+                first_cycle_len = probe.metadata().unwrap().len();
+            }
+        }
+        // Without reuse every cycle appends VIRTUAL_SIZE to the file.
+        let bound = first_cycle_len.max(metadata.reclaim_threshold())
+            + ALLOC_HEADROOM_CLUSTERS * cluster_size;
+        assert!(probe.metadata().unwrap().len() <= bound);
+
+        let pattern = vec![0x5a; VIRTUAL_SIZE as usize];
+        disk.write_all_at(0, &pattern);
+        metadata.flush().unwrap();
+        drop(disk);
+        let reopened = QcowDisk::new(probe, false, false, true, false).unwrap();
+        assert_eq!(reopened.read_all_at(0, VIRTUAL_SIZE as usize), pattern);
+    }
+
+    /// Reclaim is gated on the file end, so a rewrite below the threshold
+    /// must extend the file, and the first allocation past it must reuse
+    /// freed clusters instead. Fewer than `ALLOC_HEADROOM_CLUSTERS` pending
+    /// clusters never reclaim, and a discard past the threshold reclaims
+    /// just like a write.
+    #[test]
+    fn freed_clusters_are_reclaimed_only_past_the_threshold() {
+        use super::metadata::{ALLOC_HEADROOM_CLUSTERS, DeallocAction};
+
+        // 1/32 of the virtual size is 16 clusters here, only 8 past the
+        // headroom, so once the threshold is crossed the reclaimed batch
+        // drains to a handful of clusters. At 1 MiB the headroom exceeds
+        // the slack and the threshold never gates anything.
+        const VIRTUAL_SIZE: u64 = 32 << 20;
+        // Never written up front: fresh allocations to drain the free list.
+        const RESERVE: u64 = 16;
+        let file = QcowTempDisk::new(VIRTUAL_SIZE, None, false, true, false)
+            .unwrap()
+            .into_tempfile()
+            .into_file();
+        let probe = file.try_clone().unwrap();
+        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let metadata = disk.metadata();
+        let cluster_size = metadata.cluster_size();
+        let clusters = VIRTUAL_SIZE / cluster_size;
+        let written = clusters - RESERVE;
+        let headroom = ALLOC_HEADROOM_CLUSTERS as usize;
+        let headroom_bytes = ALLOC_HEADROOM_CLUSTERS * cluster_size;
+        let threshold = metadata.reclaim_threshold();
+        let file_len = || probe.metadata().unwrap().len();
+        let avail = || metadata.free_list_len() - metadata.pending_reclaim_len();
+        let write = |cluster: u64| {
+            metadata
+                .map_cluster_for_write(cluster * cluster_size, None)
+                .unwrap_or_else(|e| panic!("write of cluster {cluster}: {e}"));
+        };
+        let discard = |first: u64, count: u64| {
+            let actions = metadata
+                .deallocate_bytes(
+                    first * cluster_size,
+                    (count * cluster_size) as usize,
+                    true,
+                    false,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("discard of {count} clusters at {first}: {e}"));
+            for action in actions {
+                if let DeallocAction::PunchHole { host_offset, .. } = action {
+                    metadata.complete_punch_hole(host_offset);
+                }
+            }
+        };
+
+        for cluster in 0..written {
+            write(cluster);
+        }
+        let start_len = file_len();
+        assert!(
+            start_len + headroom_bytes <= threshold,
+            "image must start below the threshold"
+        );
+
+        // Rewriting discarded clusters below the threshold extends the file;
+        // the first allocation that would cross it reclaims instead.
+        let to_cross = (threshold - headroom_bytes - start_len).div_ceil(cluster_size);
+        let batch = to_cross + 16;
+        assert!(batch < written);
+        let pending_before = metadata.pending_reclaim_len();
+        discard(0, batch);
+        assert_eq!(
+            metadata.pending_reclaim_len() as u64,
+            pending_before as u64 + batch
+        );
+        let mut crossed = false;
+        for cluster in 0..batch {
+            let before = file_len();
+            write(cluster);
+            if before + headroom_bytes <= threshold {
+                assert_eq!(
+                    file_len(),
+                    before + cluster_size,
+                    "cluster {cluster} below the threshold"
+                );
+            } else {
+                crossed = true;
+                assert_eq!(file_len(), before, "cluster {cluster} past the threshold");
+            }
+        }
+        assert!(crossed, "rewrites must carry the file past the threshold");
+        for cluster in written..clusters {
+            write(cluster);
+        }
+        let avail_left = avail();
+        assert!(
+            avail_left < headroom,
+            "free list after draining: {avail_left}"
+        );
+
+        // A batch smaller than the headroom is metadata churn, not freed
+        // guest data: it stays pending and allocations come from the free
+        // list or the file end, without a sync.
+        let pending = metadata.pending_reclaim_len();
+        assert!(
+            pending + 2 < headroom,
+            "pending after the crossing: {pending}"
+        );
+        discard(0, 2);
+        let pending = metadata.pending_reclaim_len();
+        let before = file_len();
+        write(0);
+        write(1);
+        assert_eq!(
+            metadata.pending_reclaim_len(),
+            pending,
+            "a small batch was reclaimed"
+        );
+        let from_file_end = 2u64.saturating_sub(avail_left as u64);
+        assert_eq!(file_len(), before + from_file_end * cluster_size);
+
+        // Past the threshold a discard reclaims as well, before its own
+        // refcount change relocates a clean block.
+        discard(100, 16);
+        let pending = metadata.pending_reclaim_len();
+        assert!(
+            pending >= 16,
+            "the discard batch must be pending: {pending}"
+        );
+        let before = file_len();
+        discard(300, 1);
+        let pending = metadata.pending_reclaim_len();
+        assert!(
+            pending < headroom,
+            "the discard did not reclaim: {pending} pending"
+        );
+        assert_eq!(
+            file_len(),
+            before,
+            "the relocated block must come from the free list"
+        );
+
+        let pattern = vec![0xa5; VIRTUAL_SIZE as usize];
+        disk.write_all_at(0, &pattern);
+        metadata.flush().unwrap();
+        drop(disk);
+        let reopened = QcowDisk::new(probe, false, false, true, false).unwrap();
+        assert_eq!(reopened.read_all_at(0, VIRTUAL_SIZE as usize), pattern);
+    }
 }

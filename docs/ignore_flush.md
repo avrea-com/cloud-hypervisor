@@ -58,6 +58,12 @@ also be lost, and terminating the VMM can lose in-process QCOW2 metadata.
 Treat this as disposable storage; guest fsync cannot restore durability
 while suppression is enabled.
 
+QCOW2 images still sync on their own in one case: once the image file has
+grown past the virtual size plus 1/32 and at least eight freed clusters are
+pending, the next allocation runs `sync_caches` (fsync plus fdatasync, under
+the metadata write lock) so those clusters can be reused instead of extending
+the file further.
+
 Closing a file does not guarantee a successful fsync. Pause drains active
 block requests and synchronously flushes backend data and format metadata,
 even with guest flush suppression enabled. A flush failure fails pause and

@@ -120,6 +120,17 @@ pub(super) struct QcowMetadata {
     decoder: Arc<dyn Decoder>,
 }
 
+/// Clusters a single allocating metadata operation can consume: a data
+/// cluster, a replacement L2 table, and refcount blocks covering both.
+pub(super) const ALLOC_HEADROOM_CLUSTERS: u64 = 8;
+
+/// Slack over the virtual size, as a divisor of it, before freed clusters
+/// are recycled without a guest flush. Fully allocating an image costs about
+/// 1/6500 of its virtual size in L2 tables and refcount blocks, so a file
+/// 1/32 past the virtual size is growing because freed clusters are not
+/// being reused.
+const RECLAIM_SLACK_DIVISOR: u64 = 32;
+
 /// The actual metadata state, accessible only through the RwLock.
 pub(crate) struct QcowState {
     pub(crate) header: QcowHeader,
@@ -370,9 +381,20 @@ impl QcowMetadata {
     }
 
     #[cfg(test)]
+    pub(super) fn reclaim_threshold(&self) -> u64 {
+        self.inner.read().unwrap().reclaim_threshold()
+    }
+
+    #[cfg(test)]
     pub(super) fn free_list_len(&self) -> usize {
         let inner = self.inner.read().unwrap();
         inner.avail_clusters.len() + inner.unref_clusters.len()
+    }
+
+    /// Freed clusters waiting for a sync before they can be handed out.
+    #[cfg(test)]
+    pub(super) fn pending_reclaim_len(&self) -> usize {
+        self.inner.read().unwrap().unref_clusters.len()
     }
 
     #[cfg(test)]
@@ -553,6 +575,7 @@ impl QcowState {
         if address >= self.header.size {
             return Err(io::Error::from_raw_os_error(EINVAL));
         }
+        self.reclaim_freed_clusters_past_threshold()?;
 
         let l1_index = self.l1_table_index(address) as usize;
         let l2_addr_disk = match self.l1_table.get(l1_index) {
@@ -666,6 +689,51 @@ impl QcowState {
                 raw_file.write_pointer_table_direct(l1_table[index], evicted.iter())
             })?;
         }
+        Ok(())
+    }
+
+    /// File size past which freed clusters are recycled without waiting for
+    /// a guest flush, capped at the offsets the refcount table can address.
+    fn reclaim_threshold(&self) -> u64 {
+        let size = self.header.size;
+        size.saturating_add(size / RECLAIM_SLACK_DIVISOR)
+            .min(self.refcounts.max_valid_cluster_offset())
+    }
+
+    /// Makes clusters freed since the last flush reusable once the image file
+    /// has outgrown its virtual size.
+    ///
+    /// Freed clusters normally become reusable only in `flush`, after
+    /// `sync_caches` has made the metadata that stopped referencing them
+    /// durable. When guest flushes never reach the image (ignore_flush=on),
+    /// every allocation extends the file instead, and the overlay grows
+    /// without bound although the guest has discarded most of its data.
+    /// This performs the same sync and recycle on demand. Callers run it
+    /// before mutating any metadata, while every cluster in `unref_clusters`
+    /// has a zero refcount and no pending host punch-hole.
+    ///
+    /// The sync leaves every cached table clean, so the next refcount or L2
+    /// change relocates its table and puts the old copy straight back onto
+    /// `unref_clusters`. Reclaiming for a single pending cluster would
+    /// therefore sync again on the very next call; only a batch at least as
+    /// large as the allocation headroom is worth a sync.
+    fn reclaim_freed_clusters_past_threshold(&mut self) -> io::Result<()> {
+        if (self.unref_clusters.len() as u64) < ALLOC_HEADROOM_CLUSTERS
+            || self.avail_clusters.len() as u64 >= ALLOC_HEADROOM_CLUSTERS
+        {
+            return Ok(());
+        }
+        let headroom = ALLOC_HEADROOM_CLUSTERS * self.raw_file.cluster_size();
+        let file_end = self.raw_file.physical_size()?;
+        if file_end.saturating_add(headroom) <= self.reclaim_threshold() {
+            return Ok(());
+        }
+        self.sync_caches()?;
+        log::debug!(
+            "Reclaiming {} freed QCOW2 clusters past the virtual size",
+            self.unref_clusters.len()
+        );
+        self.avail_clusters.append(&mut self.unref_clusters);
         Ok(())
     }
 
@@ -907,6 +975,9 @@ impl QcowState {
         if address >= self.header.size {
             return Err(io::Error::from_raw_os_error(EINVAL));
         }
+        // A zero marker may allocate an L2 table, and a refcount decrement
+        // may relocate a clean refcount block.
+        self.reclaim_freed_clusters_past_threshold()?;
 
         let l1_index = self.l1_table_index(address) as usize;
         let l2_addr_disk = match self.l1_table.get(l1_index) {
