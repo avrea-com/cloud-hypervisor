@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::fs::File;
+use std::io;
 use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
@@ -74,7 +75,9 @@ impl AsyncIo for RawAsync {
                 .map_err(AsyncIoError::Fsync)?;
         } else {
             // SAFETY: FFI call with a valid fd
-            unsafe { libc::fsync(fd) };
+            if unsafe { libc::fsync(fd) } < 0 {
+                return Err(AsyncIoError::Fsync(io::Error::last_os_error()));
+            }
         }
 
         Ok(())
