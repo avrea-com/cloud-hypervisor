@@ -495,6 +495,14 @@ pub struct DiskConfig {
     /// and only a host crash or power loss can corrupt the image.
     #[serde(default)]
     pub ignore_flush: bool,
+    /// Maximum idle polling window, in microseconds: how long a queue thread
+    /// keeps polling for new requests and completions after the last one it
+    /// found, with guest notifications suppressed. Each one found restarts
+    /// the window, and one stay in the poll loop is capped at 1000
+    /// microseconds. The window adapts between zero and this bound. Zero
+    /// (the default) disables polling.
+    #[serde(default)]
+    pub poll_max_us: u32,
 }
 
 impl ApplyLandlock for DiskConfig {

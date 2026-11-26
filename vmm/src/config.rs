@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 use virtio_bindings::virtio_ids::*;
-use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
+use virtio_devices::block::{DISK_POLL_MAX_US, MINIMUM_BLOCK_QUEUE_SIZE};
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
 
@@ -463,6 +463,12 @@ pub enum ValidationError {
         "ignore_flush is not supported with vhost-user; set it on the vhost-user-block backend instead"
     )]
     VhostUserIgnoreFlushNotSupported,
+    /// Polling is not supported with vhost-user
+    #[error("poll_max_us is not supported with vhost-user")]
+    VhostUserDiskPollNotSupported,
+    /// Poll window above the limit
+    #[error("poll_max_us must be at most {0}")]
+    DiskPollMaxTooLarge(u32),
     /// The specified I/O port was invalid. It should be provided in hex, such as `0xe9`.
     #[cfg(target_arch = "x86_64")]
     #[error("The IO port was not properly provided in hex or a `0x` prefix is missing: {0}")]
@@ -1645,7 +1651,8 @@ impl DiskConfig {
         queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
         image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-        guest_block_size=<size_in_bytes>,ignore_flush=on|off\"";
+        guest_block_size=<size_in_bytes>,ignore_flush=on|off,\
+        poll_max_us=<microseconds>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1669,6 +1676,7 @@ impl DiskConfig {
             .add("lock_granularity")
             .add("guest_block_size")
             .add("ignore_flush")
+            .add("poll_max_us")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1747,6 +1755,10 @@ impl DiskConfig {
             .map_err(Error::ParseDisk)?
             .unwrap_or(Toggle(false))
             .0;
+        let poll_max_us = parser
+            .convert::<u32>("poll_max_us")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_default();
 
         let guest_block_size = parser
             .convert::<u32>("guest_block_size")
@@ -1784,6 +1796,7 @@ impl DiskConfig {
             lock_granularity,
             guest_block_size,
             ignore_flush,
+            poll_max_us,
         })
     }
 
@@ -1837,6 +1850,18 @@ impl DiskConfig {
         // silently leave durability guarantees intact.
         if self.vhost_user && self.ignore_flush {
             return Err(ValidationError::VhostUserIgnoreFlushNotSupported);
+        }
+
+        // The vhost-user backend runs the queues, so there is nothing here
+        // to poll.
+        if self.vhost_user && self.poll_max_us > 0 {
+            return Err(ValidationError::VhostUserDiskPollNotSupported);
+        }
+
+        // The window may grow up to this bound but one stay in the poll loop
+        // is capped at 1 ms, so a larger bound would never be used.
+        if self.poll_max_us > DISK_POLL_MAX_US {
+            return Err(ValidationError::DiskPollMaxTooLarge(DISK_POLL_MAX_US));
         }
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
@@ -5639,6 +5664,7 @@ pub(crate) mod tests {
             lock_granularity: LockGranularityChoice::default(),
             guest_block_size: None,
             ignore_flush: false,
+            poll_max_us: 0,
         }
     }
 
@@ -5786,6 +5812,19 @@ pub(crate) mod tests {
             DiskConfig::parse("path=/path/to_file,ignore_flush=off")?,
             DiskConfig { ..disk_fixture() }
         );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,poll_max_us=32")?,
+            DiskConfig {
+                poll_max_us: 32,
+                ..disk_fixture()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,poll_max_us=0")?,
+            DiskConfig { ..disk_fixture() }
+        );
+        DiskConfig::parse("path=/path/to_file,poll_max_us=-1").unwrap_err();
+        DiskConfig::parse("path=/path/to_file,poll_max_us=fast").unwrap_err();
         Ok(())
     }
 
@@ -8270,6 +8309,38 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..raw_disk_fixture()
         }]);
         still_valid_config.validate().unwrap();
+
+        // Test vhost_user with a poll window for disk
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.disks = Some(vec![DiskConfig {
+            path: None,
+            vhost_user: true,
+            vhost_socket: Some("/path/to/sock".to_owned()),
+            poll_max_us: 32,
+            ..disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::VhostUserDiskPollNotSupported)
+        );
+
+        // A poll window is accepted up to the bound and rejected above it
+        for (poll_max_us, valid) in [(1, true), (1000, true), (1001, false)] {
+            let mut config = valid_config.clone();
+            config.disks = Some(vec![DiskConfig {
+                poll_max_us,
+                ..raw_disk_fixture()
+            }]);
+            if valid {
+                config.validate().unwrap();
+            } else {
+                assert_eq!(
+                    config.validate(),
+                    Err(ValidationError::DiskPollMaxTooLarge(1000))
+                );
+            }
+        }
 
         // Test vhost_user with rate limiting for net
         let mut invalid_config = valid_config.clone();

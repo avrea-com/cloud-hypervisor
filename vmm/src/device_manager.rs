@@ -3058,6 +3058,7 @@ impl DeviceManager {
                 queue_affinity,
                 disk_cfg.sparse,
                 disk_cfg.ignore_flush,
+                disk_cfg.poll_max_us,
                 disk_cfg.lock_granularity,
                 disk_cfg.guest_block_size,
             )
