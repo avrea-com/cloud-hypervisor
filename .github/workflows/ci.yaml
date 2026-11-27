@@ -84,6 +84,9 @@ jobs:
           echo "full=$full"
   dco:
     name: dco
+    # Avrea fork: commits carry no Signed-off-by, so the DCO check is off.
+    # Add the sign-off when sending a patch upstream.
+    if: false
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 10
