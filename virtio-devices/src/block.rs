@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use std::{io, mem, result, thread};
+use std::{hint, io, mem, result, thread};
 
 use anyhow::anyhow;
 use block::async_io::AsyncIo;
@@ -54,6 +54,7 @@ use super::{
     VirtioInterruptType,
 };
 use crate::device::ActivationContext;
+use crate::epoll_helper::{EPOLL_HELPER_EVENT_KILL, EPOLL_HELPER_EVENT_PAUSE};
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::PauseCommon;
 use crate::{GuestMemory, VirtioInterrupt};
@@ -190,6 +191,91 @@ struct BlockEpollHandler {
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
     ignore_flush: bool,
+    poll: PollState,
+    /// The used ring index at the last notification check. A check with
+    /// nothing added since then has nothing to tell the guest.
+    used_at_last_signal_check: Option<u16>,
+}
+
+/// Adaptive busy-polling of the avail ring and the completion queue before
+/// the queue thread goes back to sleep in epoll. While polling, guest
+/// notifications stay suppressed, so a guest that submits one request at a
+/// time does not exit for each of them.
+#[derive(Default)]
+struct PollState {
+    /// Upper bound of one idle poll window. Zero disables polling.
+    max: Duration,
+    /// Current idle poll window, between zero and `max`.
+    cur: Duration,
+    /// Set while the poll loop runs: completion paths must not re-enable
+    /// guest notifications.
+    active: bool,
+    /// When the thread last returned to epoll.
+    idle_since: Option<Instant>,
+    /// Whether the backend's completion eventfd and the queue eventfd are
+    /// non-blocking, so draining them cannot block the thread.
+    drain_completions: bool,
+    drain_kicks: bool,
+}
+
+/// What one pass of the poll loop found.
+#[derive(Debug, PartialEq, Eq)]
+enum PollProgress {
+    /// Requests were submitted or completions collected.
+    Work,
+    /// Nothing to do yet.
+    Idle,
+    /// Stop polling: the rate limiter blocked, a pause started draining, or
+    /// the backend reported an error that would otherwise repeat every pass.
+    Stop,
+}
+
+/// Upper bound of `poll_max_us`, and the longest uninterrupted stay in the
+/// poll loop, so kill, pause and rate limiter events on the epoll set are
+/// still served under sustained load.
+pub const DISK_POLL_MAX_US: u32 = 1000;
+const POLL_MAX_STAY: Duration = Duration::from_micros(DISK_POLL_MAX_US as u64);
+const POLL_START: Duration = Duration::from_micros(4);
+
+impl PollState {
+    fn new(max: Duration) -> Self {
+        Self {
+            max,
+            ..Default::default()
+        }
+    }
+
+    /// Called once per epoll batch that wakes the queue thread. An event
+    /// that arrives within `max` of going to sleep means a longer window
+    /// would have caught it, so the window doubles. Returns whether this
+    /// batch should end with a poll window.
+    fn wake(&mut self, now: Instant) -> bool {
+        if self.max.is_zero() {
+            return false;
+        }
+        if let Some(idle_since) = self.idle_since.take()
+            && now.saturating_duration_since(idle_since) < self.max
+        {
+            // A bound below POLL_START starts at the bound.
+            self.cur = (self.cur * 2).clamp(POLL_START.min(self.max), self.max);
+        }
+        !self.cur.is_zero()
+    }
+
+    /// Called when a poll window ends. A window that found nothing halves.
+    fn window_done(&mut self, found_work: bool) {
+        if !found_work {
+            self.cur /= 2;
+            if self.cur < Duration::from_micros(1) {
+                self.cur = Duration::ZERO;
+            }
+        }
+    }
+
+    /// Called when the queue thread goes back to epoll.
+    fn sleep(&mut self, now: Instant) {
+        self.idle_since = Some(now);
+    }
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -228,6 +314,27 @@ impl BlockEpollHandler {
         batch.iter().any(|(h, ..)| *h == head) || inflight.iter().any(|(h, ..)| *h == head)
     }
 
+    /// Puts a finished chain on the used ring. Outside a poll window this
+    /// also re-enables guest notifications, as without polling; inside one
+    /// they stay suppressed until the window ends.
+    fn add_used(
+        queue: &mut Queue,
+        mem: &GuestMemory,
+        head: u16,
+        len: u32,
+        polling: bool,
+    ) -> Result<()> {
+        queue
+            .add_used(mem, head, len)
+            .map_err(Error::QueueAddUsed)?;
+        if !polling {
+            queue
+                .enable_notification(mem)
+                .map_err(Error::QueueEnableNotification)?;
+        }
+        Ok(())
+    }
+
     fn process_queue_submit(&mut self) -> Result<()> {
         // Artificially bump the active counter while submitting so pause doesn't
         // race and read a zero.
@@ -239,6 +346,7 @@ impl BlockEpollHandler {
             return Ok(());
         }
 
+        let polling = self.poll.active;
         let queue = &mut self.queue;
         let queue_size = queue.size();
         let mut batch_requests = Vec::new();
@@ -282,12 +390,7 @@ impl BlockEpollHandler {
                             .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
                             .map_err(Error::RequestStatus)?;
                     }
-                    queue
-                        .add_used(desc_chain.memory(), head, 0)
-                        .map_err(Error::QueueAddUsed)?;
-                    queue
-                        .enable_notification(desc_chain.memory())
-                        .map_err(Error::QueueEnableNotification)?;
+                    Self::add_used(queue, desc_chain.memory(), head, 0, polling)?;
                     continue;
                 }
             };
@@ -304,12 +407,13 @@ impl BlockEpollHandler {
 
                 // If no asynchronous operation has been submitted, we can
                 // simply return the used descriptor.
-                queue
-                    .add_used(desc_chain.memory(), desc_chain.head_index(), 1)
-                    .map_err(Error::QueueAddUsed)?;
-                queue
-                    .enable_notification(desc_chain.memory())
-                    .map_err(Error::QueueEnableNotification)?;
+                Self::add_used(
+                    queue,
+                    desc_chain.memory(),
+                    desc_chain.head_index(),
+                    1,
+                    polling,
+                )?;
                 continue;
             }
 
@@ -394,12 +498,13 @@ impl BlockEpollHandler {
                 };
                 // If no asynchronous operation has been submitted, we can
                 // simply return the used descriptor.
-                queue
-                    .add_used(desc_chain.memory(), desc_chain.head_index(), len)
-                    .map_err(Error::QueueAddUsed)?;
-                queue
-                    .enable_notification(desc_chain.memory())
-                    .map_err(Error::QueueEnableNotification)?;
+                Self::add_used(
+                    queue,
+                    desc_chain.memory(),
+                    desc_chain.head_index(),
+                    len,
+                    polling,
+                )?;
             }
         }
 
@@ -419,12 +524,7 @@ impl BlockEpollHandler {
                         let mem = self.mem.memory();
                         mem.write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
                             .map_err(Error::RequestStatus)?;
-                        queue
-                            .add_used(mem.deref(), desc_index, 1)
-                            .map_err(Error::QueueAddUsed)?;
-                        queue
-                            .enable_notification(mem.deref())
-                            .map_err(Error::QueueEnableNotification)?;
+                        Self::add_used(queue, mem.deref(), desc_index, 1, polling)?;
                     }
                 }
             }
@@ -434,6 +534,13 @@ impl BlockEpollHandler {
     }
 
     fn try_signal_used_queue(&mut self) -> result::Result<(), EpollHelperError> {
+        // Without EVENT_IDX, needs_notification() is always true, so an empty
+        // pass of the poll loop would otherwise interrupt the guest for
+        // nothing.
+        let next_used = self.queue.next_used();
+        if self.used_at_last_signal_check.replace(next_used) == Some(next_used) {
+            return Ok(());
+        }
         if self
             .queue
             .needs_notification(self.mem.memory().deref())
@@ -492,6 +599,7 @@ impl BlockEpollHandler {
     }
 
     fn process_queue_complete(&mut self) -> Result<()> {
+        let polling = self.poll.active;
         let mem = self.mem.memory();
         let mut read_bytes = Wrapping(0);
         let mut write_bytes = Wrapping(0);
@@ -633,14 +741,7 @@ impl BlockEpollHandler {
             mem.write_obj(status, status_addr)
                 .map_err(Error::RequestStatus)?;
 
-            let queue = &mut self.queue;
-
-            queue
-                .add_used(mem.deref(), desc_index, len)
-                .map_err(Error::QueueAddUsed)?;
-            queue
-                .enable_notification(mem.deref())
-                .map_err(Error::QueueEnableNotification)?;
+            Self::add_used(&mut self.queue, mem.deref(), desc_index, len, polling)?;
         }
 
         self.counters
@@ -660,6 +761,204 @@ impl BlockEpollHandler {
         Ok(())
     }
 
+    /// Something the queue thread could act on without waiting for an event.
+    fn progress_marker(&self) -> (u16, usize) {
+        (self.queue.next_avail(), self.inflight_requests.len())
+    }
+
+    fn rate_limited(&self) -> bool {
+        self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked())
+    }
+
+    fn rate_limited_or_draining(&self) -> bool {
+        self.rate_limited() || self.draining_active_requests.load(Ordering::SeqCst)
+    }
+
+    /// Collects finished requests and tells the guest. Returns whether the
+    /// backend reported them without error; an error is logged and leaves
+    /// the queue running.
+    fn complete_and_signal(&mut self) -> result::Result<bool, EpollHelperError> {
+        let completed = match self.process_queue_complete() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to process queue (complete): {e:?}");
+                false
+            }
+        };
+        self.try_signal_used_queue()?;
+        Ok(completed)
+    }
+
+    /// Submits new requests, skipping the pass when the guest added none.
+    fn submit_new_requests(&mut self) -> result::Result<(), EpollHelperError> {
+        let avail_idx = self
+            .queue
+            .avail_idx(self.mem.memory().deref(), Ordering::Acquire)
+            .map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!("Failed to read the avail index: {e:?}"))
+            })?;
+        if avail_idx.0 == self.queue.next_avail() {
+            return Ok(());
+        }
+        self.process_queue_submit_and_signal()
+    }
+
+    /// Runs one submit and complete pass and reports what it found.
+    fn poll_once(&mut self) -> result::Result<PollProgress, EpollHelperError> {
+        if self.rate_limited_or_draining() {
+            return Ok(PollProgress::Stop);
+        }
+        let before = self.progress_marker();
+        if !self.inflight_requests.is_empty() && !self.complete_and_signal()? {
+            return Ok(PollProgress::Stop);
+        }
+        self.submit_new_requests()?;
+        Ok(if self.progress_marker() == before {
+            PollProgress::Idle
+        } else {
+            PollProgress::Work
+        })
+    }
+
+    /// Starts an epoll batch and decides whether it ends with a poll window.
+    /// When it does, guest notifications stay suppressed for the whole batch
+    /// and the window, so the guest does not exit for the requests it adds
+    /// meanwhile. Without EVENT_IDX that means setting
+    /// VRING_USED_F_NO_NOTIFY. With EVENT_IDX it means leaving the avail
+    /// event index where the last re-arm put it, which only suppresses kicks
+    /// once the guest has moved past it: in a batch that started without a
+    /// new request, the guest's next request still kicks. A batch that also
+    /// carries a pause or kill event never polls, so the device never stops
+    /// with notifications suppressed.
+    fn poll_batch_begin(
+        &mut self,
+        queue_events: bool,
+        control_event: bool,
+    ) -> result::Result<(), EpollHelperError> {
+        self.poll.active = queue_events
+            && !control_event
+            && self.poll.wake(Instant::now())
+            && !self.rate_limited_or_draining();
+        if self.poll.active {
+            let mem = self.mem.memory();
+            self.queue.disable_notification(mem.deref()).map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!("Failed to disable notification: {e:?}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Busy-polls for new requests and completions, then re-arms guest
+    /// notifications and closes the race with one last pass.
+    fn poll_finish(&mut self) -> result::Result<(), EpollHelperError> {
+        if self.poll.max.is_zero() {
+            return Ok(());
+        }
+        if !self.poll.active {
+            self.poll.sleep(Instant::now());
+            return Ok(());
+        }
+        let entered = Instant::now();
+        let mut deadline = entered + self.poll.cur;
+        let mut found_work = false;
+        let result = loop {
+            match self.poll_once() {
+                Ok(PollProgress::Work) => {
+                    found_work = true;
+                    deadline = Instant::now() + self.poll.cur;
+                }
+                Ok(PollProgress::Idle) => {}
+                Ok(PollProgress::Stop) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+            let now = Instant::now();
+            if now >= deadline || now.duration_since(entered) >= POLL_MAX_STAY {
+                break Ok(());
+            }
+            hint::spin_loop();
+        };
+        self.poll.active = false;
+        self.poll.window_done(found_work);
+        let result = match result {
+            Ok(()) => self.rearm_after_poll(),
+            Err(e) => {
+                self.poll_abort();
+                Err(e)
+            }
+        };
+        self.poll.sleep(Instant::now());
+        result
+    }
+
+    /// Re-enables guest notifications after a poll window and closes both
+    /// races: requests the guest added before notifications were back on,
+    /// and completions the poll loop did not collect.
+    fn rearm_after_poll(&mut self) -> result::Result<(), EpollHelperError> {
+        let mem = self.mem.memory();
+        self.queue.enable_notification(mem.deref()).map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to enable notification: {e:?}"))
+        })?;
+        // The poll loop handles requests and completions without reading
+        // their eventfds, which stay readable and would wake the thread right
+        // after it sleeps, into a batch with nothing to do. Clear them, then
+        // collect what is left: a kick or completion after this point sets
+        // its eventfd again.
+        self.drain_eventfds();
+        if !self.inflight_requests.is_empty() {
+            self.complete_and_signal()?;
+        }
+        self.submit_new_requests()
+    }
+
+    /// Ends a poll window on a fatal error: turns guest notifications back
+    /// on without touching the queue again, so the worker can stop with the
+    /// original error.
+    fn poll_abort(&mut self) {
+        self.poll.active = false;
+        let mem = self.mem.memory();
+        if let Err(e) = self.queue.enable_notification(mem.deref()) {
+            warn!("Failed to enable notification after an error: {e:?}");
+        }
+    }
+
+    /// Consumes the completion eventfd that woke the thread. A poll window
+    /// that ended in the same epoll batch may have drained it already, so an
+    /// empty non-blocking eventfd is not an error.
+    fn read_completion_notifier(&self) -> result::Result<(), EpollHelperError> {
+        match self.disk_image.notifier().read() {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(EpollHelperError::HandleEvent(anyhow!(
+                "Failed to get queue event: {e:?}"
+            ))),
+        }
+    }
+
+    /// Records which eventfds can be drained. Reading an eventfd that is not
+    /// set blocks unless it is non-blocking, which every disk backend's and
+    /// transport's is; a blocking one is left set, and the thread then wakes
+    /// once more and finds nothing. fcntl rather than poll(2): the queue
+    /// thread's seccomp filter allows it.
+    fn detect_drainable_eventfds(&mut self) {
+        let nonblocking = |evt: &EventFd| {
+            // SAFETY: F_GETFL on a file descriptor the handler owns.
+            let flags = unsafe { libc::fcntl(evt.as_raw_fd(), libc::F_GETFL) };
+            flags >= 0 && flags & libc::O_NONBLOCK != 0
+        };
+        self.poll.drain_completions = nonblocking(self.disk_image.notifier());
+        self.poll.drain_kicks = nonblocking(&self.queue_evt);
+    }
+
+    fn drain_eventfds(&self) {
+        // EAGAIN means nothing was pending.
+        if self.poll.drain_completions {
+            let _ = self.disk_image.notifier().read();
+        }
+        if self.poll.drain_kicks {
+            let _ = self.queue_evt.read();
+        }
+    }
+
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
         self.interrupt_cb
             .trigger(VirtioInterruptType::Queue(self.queue_index))
@@ -669,7 +968,8 @@ impl BlockEpollHandler {
             })
     }
 
-    fn set_queue_thread_affinity(&self) {
+    /// Returns false when a requested CPU set could not be applied.
+    fn set_queue_thread_affinity(&self) -> bool {
         // Prepare the CPU set the current queue thread is expected to run onto.
         let cpuset = self.host_cpus.as_ref().map(|host_cpus| {
             // SAFETY: all zeros is a valid pattern
@@ -695,7 +995,21 @@ impl BlockEpollHandler {
                     self.queue_index,
                     io::Error::last_os_error()
                 );
+                return false;
             }
+        }
+        true
+    }
+
+    /// Pins the queue thread. A poller that cannot be pinned would spin on
+    /// whichever host CPUs it lands on, so it falls back to event-driven I/O.
+    fn pin_queue_thread(&mut self) {
+        if !self.set_queue_thread_affinity() && !self.poll.max.is_zero() {
+            warn!(
+                "Queue {} falls back to event-driven I/O: its poller could not be pinned",
+                self.queue_index
+            );
+            self.poll.max = Duration::ZERO;
         }
     }
 
@@ -706,48 +1020,72 @@ impl BlockEpollHandler {
         if let Some(rate_limiter) = &self.rate_limiter {
             helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
         }
-        self.set_queue_thread_affinity();
-        helper.run(pause_common, self)?;
+        self.pin_queue_thread();
+        self.detect_drainable_eventfds();
+        // With polling on, the event list starts each batch, so the poll
+        // window adapts and runs once per batch. Without it, events take the
+        // plain dispatch path.
+        let polling = !self.poll.max.is_zero();
+        helper.run_with_timeout(pause_common, self, -1, polling)?;
 
         Ok(())
     }
 }
 
 impl EpollHelperHandler for BlockEpollHandler {
+    fn event_list(
+        &mut self,
+        _helper: &mut EpollHelper,
+        events: &[epoll::Event],
+    ) -> result::Result<(), EpollHelperError> {
+        let is_control = |e: &epoll::Event| {
+            matches!(
+                e.data as u16,
+                EPOLL_HELPER_EVENT_PAUSE | EPOLL_HELPER_EVENT_KILL
+            )
+        };
+        let control_event = events.iter().any(is_control);
+        let queue_events = events.iter().any(|e| !is_control(e));
+        self.poll_batch_begin(queue_events, control_event)
+    }
+
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
         event: &epoll::Event,
     ) -> result::Result<(), EpollHelperError> {
-        let ev_type = event.data as u16;
+        let result = self.handle_queue_event(event.data as u16);
+        // The helper stops the worker on an error and skips batch_done().
+        if result.is_err() && self.poll.active {
+            self.poll_abort();
+        }
+        result
+    }
+
+    fn batch_done(&mut self, _helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
+        self.poll_finish()
+    }
+}
+
+impl BlockEpollHandler {
+    fn handle_queue_event(&mut self, ev_type: u16) -> result::Result<(), EpollHelperError> {
         match ev_type {
             QUEUE_AVAIL_EVENT => {
                 self.queue_evt.read().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
                 })?;
 
-                let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
-
                 // Process the queue only when the rate limit is not reached
-                if !rate_limit_reached {
+                if !self.rate_limited() {
                     self.process_queue_submit_and_signal()?;
                 }
             }
             COMPLETION_EVENT => {
-                self.disk_image.notifier().read().map_err(|e| {
-                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
-                })?;
-
-                if let Err(e) = self.process_queue_complete() {
-                    warn!("Failed to process queue (complete): {e:?}");
-                }
-
-                self.try_signal_used_queue()?;
-
-                let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+                self.read_completion_notifier()?;
+                self.complete_and_signal()?;
 
                 // Process the queue only when the rate limit is not reached
-                if !rate_limit_reached {
+                if !self.rate_limited() {
                     self.process_queue_submit_and_signal()?;
                 }
             }
@@ -794,6 +1132,7 @@ pub struct Block {
     serial: Box<[u8]>,
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
     ignore_flush: bool,
+    poll_max: Duration,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
@@ -828,6 +1167,7 @@ impl Block {
         queue_affinity: BTreeMap<u16, Box<[usize]>>,
         sparse: bool,
         ignore_flush: bool,
+        poll_max_us: u32,
         lock_granularity: LockGranularityChoice,
         guest_block_size: Option<u32>,
     ) -> io::Result<Self> {
@@ -944,6 +1284,11 @@ impl Block {
                  Disk contents are not crash-consistent if the host goes down."
             );
         }
+        if poll_max_us > 0 {
+            info!(
+                "virtio-block {id}: busy-polling queues for up to {poll_max_us} us after each event"
+            );
+        }
 
         Ok(Block {
             common: VirtioCommon {
@@ -967,6 +1312,7 @@ impl Block {
             serial,
             queue_affinity,
             ignore_flush,
+            poll_max: Duration::from_micros(poll_max_us.into()),
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
@@ -1248,6 +1594,8 @@ impl VirtioDevice for Block {
                     .unwrap(),
                 access_platform: self.common.access_platform(),
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
+                poll: PollState::new(self.poll_max),
+                used_at_last_signal_check: None,
                 acked_features: self.common.acked_features,
                 ignore_flush: self.ignore_flush,
                 active_request_count: Arc::clone(&self.active_request_count),
@@ -1416,7 +1764,9 @@ mod tests {
     use block::async_io::{AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
     use block::formats::raw::RawBackend;
     use hypervisor::Vm;
-    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use virtio_bindings::virtio_ring::{
+        VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VRING_USED_F_NO_NOTIFY,
+    };
     use virtio_queue::desc::split::Descriptor;
     use vm_memory::GuestAddress;
     use vm_virtio::AccessType;
@@ -1490,10 +1840,55 @@ mod tests {
             BTreeMap::new(),
             true,
             false,
+            0,
             LockGranularityChoice::default(),
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn poll_window_is_off_without_a_bound() {
+        let mut poll = PollState::new(Duration::ZERO);
+        let t0 = Instant::now();
+        poll.sleep(t0);
+        assert!(!poll.wake(t0 + Duration::from_micros(1)));
+    }
+
+    #[test]
+    fn poll_window_grows_on_quick_events_and_halves_when_idle() {
+        let max = Duration::from_micros(32);
+        let mut poll = PollState::new(max);
+        let t0 = Instant::now();
+
+        // The first event after start has nothing to compare against.
+        assert!(!poll.wake(t0));
+        poll.sleep(t0);
+
+        // Events that follow soon after sleeping double the window from
+        // POLL_START up to the bound.
+        let mut now = t0;
+        for expected in [4, 8, 16, 32, 32] {
+            now += Duration::from_micros(10);
+            assert!(poll.wake(now));
+            assert_eq!(poll.cur, Duration::from_micros(expected));
+            poll.window_done(true);
+            poll.sleep(now);
+        }
+
+        // An event after a long sleep keeps the window as it is.
+        now += Duration::from_millis(5);
+        assert!(poll.wake(now));
+        assert_eq!(poll.cur, max);
+
+        // Empty windows halve it until polling stops.
+        for expected in [16, 8, 4, 2, 1, 0] {
+            poll.window_done(false);
+            assert_eq!(poll.cur, Duration::from_micros(expected));
+        }
+        poll.sleep(now);
+        now += Duration::from_millis(5);
+        assert!(!poll.wake(now));
     }
 
     #[test]
@@ -1529,7 +1924,7 @@ mod tests {
         disk_image: Box<dyn AsyncIo>,
     ) -> BlockEpollHandler {
         let evt = || EventFd::new(EFD_NONBLOCK).unwrap();
-        BlockEpollHandler {
+        let mut handler = BlockEpollHandler {
             queue_index: 0,
             queue,
             mem: GuestMemoryAtomic::new(mem.clone()),
@@ -1550,7 +1945,11 @@ mod tests {
             host_cpus: None,
             acked_features,
             ignore_flush: false,
-        }
+            poll: PollState::default(),
+            used_at_last_signal_check: None,
+        };
+        handler.detect_drainable_eventfds();
+        handler
     }
 
     const REQ_HDR_ADDR: u64 = 0x2000;
@@ -1842,6 +2241,8 @@ mod tests {
 
         fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
             self.completion = Some(AsyncIoCompletion::from_operation(op, self.result));
+            // Like a real backend, announce the completion on the eventfd.
+            self.notifier.write(1).unwrap();
             Ok(())
         }
 
@@ -1907,6 +2308,264 @@ mod tests {
             mem.read_obj(GuestAddress(vq.used.ring[0].location.0 + 4))
                 .unwrap(),
         )
+    }
+
+    fn eventfd_readable(evt: &EventFd) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd: evt.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd and a zero timeout.
+        unsafe { libc::poll(&mut pollfd, 1, 0) == 1 }
+    }
+
+    fn polling_handler(mem: &GuestMemory, vq: &GuestQ<'_, GuestMemory>) -> BlockEpollHandler {
+        let mut handler = make_handler_with_io(
+            vq.create_queue(),
+            mem,
+            0,
+            Box::new(OneShotAsyncIo::new(512)),
+        );
+        let max = Duration::from_micros(32);
+        handler.poll.max = max;
+        handler.poll.cur = max;
+        handler
+    }
+
+    #[test]
+    fn poll_window_bound_below_start_does_not_panic() {
+        let max = Duration::from_micros(1);
+        let mut poll = PollState::new(max);
+        let t0 = Instant::now();
+        assert!(!poll.wake(t0));
+        poll.sleep(t0);
+        assert!(poll.wake(t0 + Duration::from_nanos(500)));
+        assert_eq!(poll.cur, max);
+    }
+
+    #[test]
+    fn batch_with_pause_or_kill_event_does_not_poll() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let mut handler = polling_handler(&mem, &vq);
+
+        handler.poll_batch_begin(true, true).unwrap();
+        assert!(!handler.poll.active);
+        assert_eq!(vq.used.flags.get(), 0);
+    }
+
+    #[test]
+    fn poll_loop_stops_when_a_pause_starts_draining() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let mut handler = polling_handler(&mem, &vq);
+
+        assert_eq!(handler.poll_once().unwrap(), PollProgress::Idle);
+        handler
+            .draining_active_requests
+            .store(true, Ordering::SeqCst);
+        assert_eq!(handler.poll_once().unwrap(), PollProgress::Stop);
+    }
+
+    /// Puts one read request on the avail ring.
+    fn add_read_request(mem: &GuestMemory, vq: &GuestQ<'_, GuestMemory>) {
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        vq.dtable[0].set(REQ_HDR_ADDR, 16, next, 1);
+        vq.dtable[1].set(REQ_DATA_ADDR, 512, next | write, 2);
+        vq.dtable[2].set(REQ_STATUS_ADDR, 1, write, 0);
+        let idx = vq.avail.idx.get();
+        vq.avail.ring[usize::from(idx) % vq.avail.ring.len()].set(0);
+        vq.avail.idx.set(idx.wrapping_add(1));
+    }
+
+    #[test]
+    fn failed_event_rearms_notifications_without_touching_the_queue() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let mut handler = polling_handler(&mem, &vq);
+        handler.disk_nsectors.store(8, Ordering::SeqCst);
+        let kill_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut helper = EpollHelper::new(&kill_evt, &pause_evt).unwrap();
+
+        handler.poll_batch_begin(true, false).unwrap();
+        assert_eq!(vq.used.flags.get(), VRING_USED_F_NO_NOTIFY as u16);
+        // A request the guest added during the batch, before an event fails.
+        add_read_request(&mem, &vq);
+        let unknown = epoll::Event::new(epoll::Events::EPOLLIN, u64::from(u16::MAX));
+        handler.handle_event(&mut helper, &unknown).unwrap_err();
+
+        assert_eq!(
+            vq.used.flags.get(),
+            0,
+            "guest notifications were left suppressed after a failed event"
+        );
+        assert!(!handler.poll.active);
+        assert_eq!(
+            handler.queue.next_avail(),
+            0,
+            "the queue was processed after a fatal error"
+        );
+        assert!(handler.inflight_requests.is_empty());
+    }
+
+    struct InterruptCounter(Arc<AtomicUsize>);
+    impl VirtioInterrupt for InterruptCounter {
+        fn trigger(&self, _: VirtioInterruptType) -> IoResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn set_notifier(&self, _: u32, _: Option<EventFd>, _: &dyn Vm) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn idle_poll_passes_do_not_interrupt_the_guest_without_event_idx() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let mut handler = polling_handler(&mem, &vq);
+        handler.disk_nsectors.store(8, Ordering::SeqCst);
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        handler.interrupt_cb = Arc::new(InterruptCounter(Arc::clone(&interrupts)));
+
+        handler.poll_batch_begin(true, false).unwrap();
+        for _ in 0..100 {
+            assert_eq!(handler.poll_once().unwrap(), PollProgress::Idle);
+        }
+        assert_eq!(
+            interrupts.load(Ordering::SeqCst),
+            0,
+            "empty poll passes interrupted the guest"
+        );
+
+        // A completed request is signalled; the empty passes after it are not.
+        add_read_request(&mem, &vq);
+        for _ in 0..2 {
+            handler.poll_once().unwrap();
+        }
+        assert_eq!(vq.used.idx.get(), 1);
+        let signalled = interrupts.load(Ordering::SeqCst);
+        assert!(signalled >= 1, "the completed request was not signalled");
+        for _ in 0..100 {
+            assert_eq!(handler.poll_once().unwrap(), PollProgress::Idle);
+        }
+        assert_eq!(
+            interrupts.load(Ordering::SeqCst),
+            signalled,
+            "empty poll passes interrupted the guest"
+        );
+    }
+
+    #[test]
+    fn rearm_drains_kicks_the_window_handled_and_keeps_late_requests() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let mut handler = polling_handler(&mem, &vq);
+        handler.disk_nsectors.store(8, Ordering::SeqCst);
+
+        handler.poll_batch_begin(true, false).unwrap();
+        handler.poll.active = false;
+        // A request and its kick that arrive as the window ends: the kick is
+        // drained, so the request must be picked up before sleeping.
+        add_read_request(&mem, &vq);
+        handler.queue_evt.write(1).unwrap();
+        handler.rearm_after_poll().unwrap();
+
+        assert!(
+            !eventfd_readable(&handler.queue_evt),
+            "a handled kick would wake the thread into an empty batch"
+        );
+        assert_eq!(
+            handler.queue.next_avail(),
+            1,
+            "the request behind a drained kick was not submitted"
+        );
+    }
+
+    #[test]
+    fn unpinnable_poller_falls_back_to_events() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let mut handler = polling_handler(&mem, &vq);
+        // No host has this CPU online, so sched_setaffinity fails.
+        handler.host_cpus = Some(Box::new([libc::CPU_SETSIZE as usize - 1]));
+
+        handler.pin_queue_thread();
+        assert!(handler.poll.max.is_zero());
+    }
+
+    #[test]
+    fn poll_window_suppresses_and_rearms_notifications_without_event_idx() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        vq.dtable[0].set(REQ_HDR_ADDR, 16, next, 1);
+        vq.dtable[1].set(REQ_DATA_ADDR, 512, next | write, 2);
+        vq.dtable[2].set(REQ_STATUS_ADDR, 1, write, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let mut handler = make_handler_with_io(
+            vq.create_queue(),
+            &mem,
+            0,
+            Box::new(OneShotAsyncIo::new(512)),
+        );
+        handler.disk_nsectors.store(8, Ordering::SeqCst);
+        let max = Duration::from_micros(32);
+        handler.poll.max = max;
+        handler.poll.cur = max;
+
+        handler.poll_batch_begin(true, false).unwrap();
+        assert!(handler.poll.active);
+        assert_eq!(
+            vq.used.flags.get(),
+            VRING_USED_F_NO_NOTIFY as u16,
+            "guest notifications were not suppressed for the poll window"
+        );
+
+        handler.process_queue_submit().unwrap();
+        handler.poll_finish().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1, "the completion was not collected");
+        assert_eq!(
+            vq.used.flags.get(),
+            0,
+            "guest notifications were not re-armed"
+        );
+        assert!(
+            !eventfd_readable(handler.disk_image.notifier()),
+            "a collected completion left the backend eventfd readable"
+        );
+        assert!(!handler.poll.active);
+    }
+
+    #[test]
+    fn completion_event_after_a_drained_notifier_is_not_an_error() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        let handler = make_handler_with_io(
+            vq.create_queue(),
+            &mem,
+            0,
+            Box::new(OneShotAsyncIo::new(512)),
+        );
+
+        // A completion signal, consumed by the end of a poll window before
+        // epoll's COMPLETION_EVENT for it is handled.
+        handler.disk_image.notifier().write(1).unwrap();
+        handler.drain_eventfds();
+        assert!(!eventfd_readable(handler.disk_image.notifier()));
+
+        handler.read_completion_notifier().unwrap();
     }
 
     #[test]
@@ -2006,6 +2665,7 @@ mod tests {
             BTreeMap::new(),
             false,
             ignore_flush,
+            0,
             LockGranularityChoice::default(),
             None,
         )

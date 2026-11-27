@@ -1370,6 +1370,19 @@ components:
             Equivalent to QEMU's cache=unsafe when direct is false. Improves
             throughput for ephemeral disks at the cost of crash consistency:
             a host crash or power loss can leave the image corrupt.
+        poll_max_us:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 1000
+          default: 0
+          description: >-
+            Maximum idle polling window, in microseconds: how long a queue
+            thread keeps polling for requests and completions after the last
+            one it found, with guest notifications suppressed. Each one found
+            restarts the window, and one stay in the poll loop is capped at
+            1000 microseconds. The window adapts between zero and this bound.
+            Zero disables polling.
 
     NetConfig:
       type: object

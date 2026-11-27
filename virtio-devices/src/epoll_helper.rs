@@ -78,6 +78,12 @@ pub trait EpollHelperHandler {
     ) -> Result<(), EpollHelperError> {
         Ok(())
     }
+    // Called after every event of one epoll_wait() batch was handled, unless
+    // the loop stopped on a kill event or an error. By default, it provides a
+    // no-op implementation.
+    fn batch_done(&mut self, _helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
+        Ok(())
+    }
 }
 
 impl EpollHelper {
@@ -213,6 +219,8 @@ impl EpollHelper {
                     }
                 }
             }
+
+            handler.batch_done(self)?;
         }
     }
 
@@ -283,6 +291,8 @@ impl EpollHelper {
             if killed {
                 return Ok(());
             }
+
+            handler.batch_done(self)?;
         }
     }
 }
